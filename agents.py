@@ -451,19 +451,19 @@ class RiskAgent:
                 # Update shadow state
                 if ticker in pending_positions:
                     prev      = pending_positions[ticker]
-                    new_qty   = prev["quantity"] + qty
-                    new_cost  = (prev["avg_cost"] * prev["quantity"] + price * qty) / new_qty
+                    new_qty   = prev["shares"] + qty
+                    new_cost  = (prev["average_cost"] * prev["shares"] + price * qty) / new_qty
                     pending_positions[ticker] = {
-                        "quantity":      new_qty,
-                        "avg_cost":      new_cost,
+                        "shares":        new_qty,
+                        "average_cost":  new_cost,
                         "current_price": price,
                         "value":         new_qty * price,
                         "pnl_pct":       (price / new_cost - 1) * 100,
                     }
                 else:
                     pending_positions[ticker] = {
-                        "quantity":      qty,
-                        "avg_cost":      price,
+                        "shares":        qty,
+                        "average_cost":  price,
                         "current_price": price,
                         "value":         trade_value,
                         "pnl_pct":       0.0,
@@ -480,16 +480,16 @@ class RiskAgent:
 
                 pos        = pending_positions[ticker]
                 sell_value = min(trade_value, pos["value"])
-                qty        = min(sell_value / price, pos["quantity"])
+                qty        = min(sell_value / price, pos["shares"])
                 trade_value = qty * price
 
                 # Update shadow state
-                new_qty = pos["quantity"] - qty
+                new_qty = pos["shares"] - qty
                 if new_qty < 1e-6:
                     del pending_positions[ticker]
                 else:
-                    pending_positions[ticker]["quantity"] = new_qty
-                    pending_positions[ticker]["value"]    = new_qty * price
+                    pending_positions[ticker]["shares"] = new_qty
+                    pending_positions[ticker]["value"]  = new_qty * price
                 cash_avail += trade_value
 
             # ── Append approved trade with execution details ──────────────

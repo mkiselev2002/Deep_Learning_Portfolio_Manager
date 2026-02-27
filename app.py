@@ -8,7 +8,6 @@ Run:
     streamlit run app.py
 """
 
-import json
 import subprocess
 import sys
 from pathlib import Path
@@ -123,22 +122,12 @@ def run_simulation(
 
         # ── Step 1: Market Analysis ──────────────────────────────────────
         analysis = analysis_agent.analyze(prices_df, sim_date)
-        db.log_agent(date_str, "MarketAnalysis", json.dumps(analysis, default=str))
 
         # ── Step 2: Trade Proposals (LLM or rule-based) ──────────────────
         proposed = proposal_agent.propose_trades(analysis, portfolio, date_str, day_num)
-        db.log_agent(
-            date_str, "TradeProposal",
-            f"Proposed {len(proposed)} trade(s):\n{json.dumps(proposed, indent=2)}",
-        )
 
         # ── Step 3: Risk Validation ──────────────────────────────────────
         approved = risk_agent.validate(proposed, portfolio, prices)
-        violations_msg = "; ".join(risk_agent.violations) or "No violations."
-        db.log_agent(
-            date_str, "RiskAgent",
-            f"Approved {len(approved)}/{len(proposed)} trades.  {violations_msg}",
-        )
 
         # ── Step 4: Execution ────────────────────────────────────────────
         for trade in approved:
@@ -146,12 +135,7 @@ def run_simulation(
 
         # ── Step 5: Record portfolio snapshot ───────────────────────────
         portfolio_after = db.get_portfolio_state(prices)
-        db.record_portfolio_value(
-            date_str,
-            portfolio_after["total_value"],
-            portfolio_after["cash"],
-            portfolio_after["positions_value"],
-        )
+        db.record_portfolio_value(date_str, portfolio_after["total_value"])
 
         results["days"].append({
             "date":            date_str,
@@ -180,26 +164,12 @@ def chart_portfolio_value(history: pd.DataFrame, initial_capital: float) -> go.F
     fig = go.Figure()
 
     fig.add_trace(go.Scatter(
-        x=history["date"], y=history["total_value"],
-        name="Total Value",
+        x=history["date"], y=history["total_equity"],
+        name="Total Equity",
         mode="lines+markers",
         line=dict(color="#7c3aed", width=3),
         marker=dict(size=9),
         fill="tozeroy", fillcolor="rgba(124,58,237,0.08)",
-    ))
-    fig.add_trace(go.Scatter(
-        x=history["date"], y=history["cash"],
-        name="Cash",
-        mode="lines+markers",
-        line=dict(color="#06b6d4", width=2, dash="dash"),
-        marker=dict(size=6),
-    ))
-    fig.add_trace(go.Scatter(
-        x=history["date"], y=history["positions_value"],
-        name="Invested",
-        mode="lines+markers",
-        line=dict(color="#10b981", width=2),
-        marker=dict(size=6),
     ))
     fig.add_hline(
         y=initial_capital,
@@ -399,11 +369,11 @@ def main():
     init_cap     = st.session_state.get("sim_capital", initial_capital)
     strategy_lbl = st.session_state.get("sim_strategy", strategy)
 
-    final_val  = history_df["total_value"].iloc[-1]
+    final_val  = history_df["total_equity"].iloc[-1]
     pnl        = final_val - init_cap
     pnl_pct    = pnl / init_cap * 100.0
-    max_val    = history_df["total_value"].max()
-    drawdown   = (max_val - history_df["total_value"].min()) / max_val * 100.0
+    max_val    = history_df["total_equity"].max()
+    drawdown   = (max_val - history_df["total_equity"].min()) / max_val * 100.0
     num_trades = len(db.get_trades())
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -445,10 +415,8 @@ def main():
         def _style_action(val):
             return "color:#10b981; font-weight:bold" if val == "BUY" else "color:#ef553b; font-weight:bold"
 
-        display = trades_df[["date", "ticker", "action", "quantity", "price", "amount", "reasoning"]].copy()
-        display["price"]    = display["price"].map("${:.2f}".format)
-        display["amount"]   = display["amount"].map("${:,.2f}".format)
-        display["quantity"] = display["quantity"].map("{:.4f}".format)
+        display = trades_df[["date", "symbol", "action", "shares", "price", "reason"]].copy()
+        display["price"] = display["price"].map("${:.2f}".format)
         st.dataframe(
             display.style.map(_style_action, subset=["action"]),
             use_container_width=True,
@@ -549,8 +517,8 @@ def main():
             for t, p in final_port2["positions"].items():
                 rows.append({
                     "ETF":           t,
-                    "Shares":        f"{p['quantity']:.4f}",
-                    "Avg Cost":      f"${p['avg_cost']:.2f}",
+                    "Shares":        p["shares"],
+                    "Avg Cost":      f"${p['average_cost']:.2f}",
                     "Current Price": f"${p['current_price']:.2f}",
                     "Market Value":  f"${p['value']:,.2f}",
                     "Weight":        f"{p['value']/final_port2['total_value']*100:.1f}%",
