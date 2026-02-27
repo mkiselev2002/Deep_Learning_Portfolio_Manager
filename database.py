@@ -5,11 +5,10 @@ SQLite-backed portfolio store.
 
 Schema
 ──────
-portfolio        – single-row: cash balance
-positions        – one row per held ETF ticker
-trades           – append-only trade log
-portfolio_history– daily snapshot of total value
-agent_log        – append-only agent reasoning log
+simulation      – single-row: game state
+positions       – one row per held ETF ticker
+transactions    – append-only trade log
+daily_snapshots – daily snapshot of total equity for plotting
 """
 
 import sqlite3
@@ -43,99 +42,78 @@ class PortfolioDatabase:
     def _init_schema(self):
         with self._conn() as c:
             c.executescript("""
-                CREATE TABLE IF NOT EXISTS portfolio (
-                    id           INTEGER PRIMARY KEY CHECK (id = 1),
-                    cash         REAL    NOT NULL,
-                    last_updated TEXT    NOT NULL DEFAULT ''
+                CREATE TABLE IF NOT EXISTS simulation (
+                    id                    INTEGER PRIMARY KEY CHECK (id = 1),
+                    current_date          TEXT    NOT NULL DEFAULT '',
+                    cash_balance          REAL    NOT NULL,
+                    total_portfolio_value REAL    NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS positions (
-                    ticker   TEXT PRIMARY KEY,
-                    quantity REAL NOT NULL,
-                    avg_cost REAL NOT NULL
+                    symbol       TEXT PRIMARY KEY,
+                    shares       INTEGER NOT NULL,
+                    average_cost REAL    NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS trades (
-                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date      TEXT    NOT NULL,
-                    ticker    TEXT    NOT NULL,
-                    action    TEXT    NOT NULL,
-                    quantity  REAL    NOT NULL,
-                    price     REAL    NOT NULL,
-                    amount    REAL    NOT NULL,
-                    reasoning TEXT    NOT NULL DEFAULT ''
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date   TEXT    NOT NULL,
+                    action TEXT    NOT NULL,
+                    symbol TEXT    NOT NULL,
+                    shares INTEGER NOT NULL,
+                    price  REAL    NOT NULL,
+                    reason TEXT    NOT NULL DEFAULT ''
                 );
 
-                CREATE TABLE IF NOT EXISTS portfolio_history (
-                    date             TEXT PRIMARY KEY,
-                    total_value      REAL NOT NULL,
-                    cash             REAL NOT NULL,
-                    positions_value  REAL NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS agent_log (
-                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date    TEXT    NOT NULL,
-                    agent   TEXT    NOT NULL,
-                    content TEXT    NOT NULL
+                CREATE TABLE IF NOT EXISTS daily_snapshots (
+                    date         TEXT PRIMARY KEY,
+                    total_equity REAL NOT NULL
                 );
             """)
 
     # ── Reset ────────────────────────────────────────────────────────────
     def reset(self, initial_capital: float = INITIAL_CAPITAL):
         with self._conn() as c:
-            c.execute("DELETE FROM portfolio")
+            c.execute("DELETE FROM simulation")
             c.execute("DELETE FROM positions")
-            c.execute("DELETE FROM trades")
-            c.execute("DELETE FROM portfolio_history")
-            c.execute("DELETE FROM agent_log")
+            c.execute("DELETE FROM transactions")
+            c.execute("DELETE FROM daily_snapshots")
             c.execute(
-                "INSERT INTO portfolio (id, cash) VALUES (1, ?)",
-                (initial_capital,),
+                "INSERT INTO simulation (id, cash_balance, total_portfolio_value) VALUES (1, ?, ?)",
+                (initial_capital, initial_capital),
             )
 
     # ── Reads ────────────────────────────────────────────────────────────
     def get_cash(self) -> float:
         with self._conn() as c:
-            row = c.execute("SELECT cash FROM portfolio WHERE id = 1").fetchone()
-            return float(row["cash"]) if row else INITIAL_CAPITAL
+            row = c.execute("SELECT cash_balance FROM simulation WHERE id = 1").fetchone()
+            return float(row["cash_balance"]) if row else INITIAL_CAPITAL
 
     def get_raw_positions(self) -> dict[str, dict]:
-        """Return {ticker: {quantity, avg_cost}}."""
+        """Return {symbol: {shares, average_cost}}."""
         with self._conn() as c:
-            rows = c.execute("SELECT ticker, quantity, avg_cost FROM positions").fetchall()
-            return {r["ticker"]: {"quantity": r["quantity"], "avg_cost": r["avg_cost"]} for r in rows}
+            rows = c.execute("SELECT symbol, shares, average_cost FROM positions").fetchall()
+            return {
+                r["symbol"]: {"shares": r["shares"], "average_cost": r["average_cost"]}
+                for r in rows
+            }
 
     def get_portfolio_state(self, prices: dict[str, float]) -> dict[str, Any]:
-        """
-        Compute full portfolio snapshot enriched with current prices.
-
-        Returns
-        -------
-        {
-            "cash": float,
-            "positions": {
-                ticker: {quantity, avg_cost, current_price, value, pnl_pct}
-            },
-            "positions_value": float,
-            "total_value": float,
-        }
-        """
         cash = self.get_cash()
         raw = self.get_raw_positions()
 
         positions: dict[str, Any] = {}
         positions_value = 0.0
 
-        for ticker, pos in raw.items():
-            price = prices.get(ticker)
+        for symbol, pos in raw.items():
+            price = prices.get(symbol)
             if price is None:
                 continue
-            value = pos["quantity"] * price
-            pnl_pct = (price / pos["avg_cost"] - 1.0) * 100.0 if pos["avg_cost"] > 0 else 0.0
-            positions[ticker] = {
-                "quantity":      pos["quantity"],
-                "avg_cost":      pos["avg_cost"],
+            value = pos["shares"] * price
+            pnl_pct = (price / pos["average_cost"] - 1.0) * 100.0 if pos["average_cost"] > 0 else 0.0
+            positions[symbol] = {
+                "shares":        pos["shares"],
+                "average_cost":  pos["average_cost"],
                 "current_price": price,
                 "value":         value,
                 "pnl_pct":       pnl_pct,
@@ -151,91 +129,76 @@ class PortfolioDatabase:
 
     # ── Writes ───────────────────────────────────────────────────────────
     def execute_trade(self, trade: dict, date: str):
-        """Apply a validated trade dict to cash + positions tables and log it."""
-        ticker    = trade["ticker"]
-        action    = trade["action"]
-        qty       = float(trade["quantity"])
-        price     = float(trade["price"])
-        amount    = float(trade["amount"])
-        reasoning = str(trade.get("reasoning", ""))
+        """Apply a validated trade dict to simulation + positions tables and log it."""
+        symbol = trade.get("ticker", trade.get("symbol", ""))
+        action = trade["action"]
+        shares = int(trade.get("quantity", trade.get("shares", 0)))
+        price  = float(trade["price"])
+        amount = shares * price
+        reason = str(trade.get("reasoning", trade.get("reason", "")))
 
         with self._conn() as c:
             if action == "BUY":
                 c.execute(
-                    "UPDATE portfolio SET cash = cash - ?, last_updated = ? WHERE id = 1",
+                    "UPDATE simulation SET cash_balance = cash_balance - ?, current_date = ? WHERE id = 1",
                     (amount, date),
                 )
                 existing = c.execute(
-                    "SELECT quantity, avg_cost FROM positions WHERE ticker = ?", (ticker,)
+                    "SELECT shares, average_cost FROM positions WHERE symbol = ?", (symbol,)
                 ).fetchone()
                 if existing:
-                    new_qty  = existing["quantity"] + qty
-                    new_cost = (existing["avg_cost"] * existing["quantity"] + price * qty) / new_qty
+                    new_shares = existing["shares"] + shares
+                    new_cost   = (existing["average_cost"] * existing["shares"] + price * shares) / new_shares
                     c.execute(
-                        "UPDATE positions SET quantity = ?, avg_cost = ? WHERE ticker = ?",
-                        (new_qty, new_cost, ticker),
+                        "UPDATE positions SET shares = ?, average_cost = ? WHERE symbol = ?",
+                        (new_shares, new_cost, symbol),
                     )
                 else:
                     c.execute(
-                        "INSERT INTO positions (ticker, quantity, avg_cost) VALUES (?, ?, ?)",
-                        (ticker, qty, price),
+                        "INSERT INTO positions (symbol, shares, average_cost) VALUES (?, ?, ?)",
+                        (symbol, shares, price),
                     )
 
             elif action == "SELL":
                 c.execute(
-                    "UPDATE portfolio SET cash = cash + ?, last_updated = ? WHERE id = 1",
+                    "UPDATE simulation SET cash_balance = cash_balance + ?, current_date = ? WHERE id = 1",
                     (amount, date),
                 )
                 existing = c.execute(
-                    "SELECT quantity FROM positions WHERE ticker = ?", (ticker,)
+                    "SELECT shares FROM positions WHERE symbol = ?", (symbol,)
                 ).fetchone()
                 if existing:
-                    new_qty = existing["quantity"] - qty
-                    if new_qty < 1e-6:
-                        c.execute("DELETE FROM positions WHERE ticker = ?", (ticker,))
+                    new_shares = existing["shares"] - shares
+                    if new_shares <= 0:
+                        c.execute("DELETE FROM positions WHERE symbol = ?", (symbol,))
                     else:
                         c.execute(
-                            "UPDATE positions SET quantity = ? WHERE ticker = ?",
-                            (new_qty, ticker),
+                            "UPDATE positions SET shares = ? WHERE symbol = ?",
+                            (new_shares, symbol),
                         )
 
             c.execute(
-                "INSERT INTO trades (date, ticker, action, quantity, price, amount, reasoning)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (date, ticker, action, qty, price, amount, reasoning),
+                "INSERT INTO transactions (date, action, symbol, shares, price, reason)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (date, action, symbol, shares, price, reason),
             )
 
-    def record_portfolio_value(
-        self,
-        date: str,
-        total_value: float,
-        cash: float,
-        positions_value: float,
-    ):
+    def record_portfolio_value(self, date: str, total_equity: float):
         with self._conn() as c:
             c.execute(
-                "INSERT OR REPLACE INTO portfolio_history"
-                " (date, total_value, cash, positions_value)"
-                " VALUES (?, ?, ?, ?)",
-                (date, total_value, cash, positions_value),
+                "INSERT OR REPLACE INTO daily_snapshots (date, total_equity) VALUES (?, ?)",
+                (date, total_equity),
             )
-
-    def log_agent(self, date: str, agent: str, content: str):
-        with self._conn() as c:
             c.execute(
-                "INSERT INTO agent_log (date, agent, content) VALUES (?, ?, ?)",
-                (date, agent, content),
+                "UPDATE simulation SET total_portfolio_value = ? WHERE id = 1",
+                (total_equity,),
             )
 
     # ── Bulk reads (for display) ─────────────────────────────────────────
     def get_portfolio_history(self) -> pd.DataFrame:
         with self._conn() as c:
-            return pd.read_sql("SELECT * FROM portfolio_history ORDER BY date", c)
+            return pd.read_sql("SELECT * FROM daily_snapshots ORDER BY date", c)
 
     def get_trades(self) -> pd.DataFrame:
         with self._conn() as c:
-            return pd.read_sql("SELECT * FROM trades ORDER BY date, id", c)
-
-    def get_agent_log(self) -> pd.DataFrame:
-        with self._conn() as c:
-            return pd.read_sql("SELECT * FROM agent_log ORDER BY id", c)
+            return pd.read_sql("SELECT * FROM transactions ORDER BY date, id", c)
