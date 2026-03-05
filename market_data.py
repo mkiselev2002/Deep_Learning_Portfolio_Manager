@@ -110,6 +110,54 @@ def fetch_today_prices(tickers: list[str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def fetch_sp500_prices_csv(csv_path: str, years: int = 2) -> pd.DataFrame:
+    """
+    Fetches the current S&P 500 constituent list from Wikipedia, then downloads
+    `years` of daily adjusted close prices for every stock via yfinance.
+
+    Tickers with more than 20 % missing rows are dropped (e.g. recent IPOs).
+    The result is written to csv_path and returned as a DataFrame.
+
+    Raises ValueError if yfinance returns no data at all.
+    """
+    from pathlib import Path
+
+    # Step 1: get the current constituent list
+    constituents = get_sp500_constituents()
+    tickers = constituents["symbol"].tolist()
+
+    # Step 2: bulk-download historical closes
+    raw = yf.download(
+        tickers,
+        period=f"{years}y",
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        threads=True,
+    )
+
+    if raw.empty:
+        raise ValueError("yfinance returned no price data for S&P 500 tickers.")
+
+    # Extract close prices — bulk download always returns MultiIndex
+    if isinstance(raw.columns, pd.MultiIndex):
+        close_df = raw["Close"].copy()
+    else:
+        close_df = raw.copy()
+
+    # Drop rows that are entirely NaN, then drop tickers with >20 % missing
+    close_df = close_df.dropna(how="all")
+    min_rows  = int(len(close_df) * 0.80)
+    close_df  = close_df.dropna(axis=1, thresh=min_rows)
+    close_df  = close_df.dropna(how="all")
+    close_df.index.name = "Date"
+
+    Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
+    close_df.to_csv(csv_path)
+
+    return close_df
+
+
 def fetch_and_store_sp500(db) -> pd.DataFrame:
     """
     Main entry point: fetches S&P 500 constituents + latest prices,

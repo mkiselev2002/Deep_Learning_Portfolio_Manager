@@ -46,7 +46,8 @@ class PortfolioDatabase:
                     id                    INTEGER PRIMARY KEY CHECK (id = 1),
                     current_date          TEXT    NOT NULL DEFAULT '',
                     cash_balance          REAL    NOT NULL,
-                    total_portfolio_value REAL    NOT NULL DEFAULT 0
+                    total_portfolio_value REAL    NOT NULL DEFAULT 0,
+                    last_advance_date     TEXT    NOT NULL DEFAULT ''
                 );
 
                 CREATE TABLE IF NOT EXISTS positions (
@@ -85,15 +86,40 @@ class PortfolioDatabase:
                 );
             """)
 
+        # ── Migration: add columns that didn't exist in older DB files ────
+        with self._conn() as c:
+            try:
+                c.execute(
+                    "ALTER TABLE simulation ADD COLUMN last_advance_date TEXT NOT NULL DEFAULT ''"
+                )
+            except Exception:
+                pass  # column already exists — nothing to do
+
     # ── Reset ────────────────────────────────────────────────────────────
     def reset(self, initial_capital: float = INITIAL_CAPITAL):
+        """Resets portfolio state only (keeps sp500_stocks cache intact)."""
         with self._conn() as c:
             c.execute("DELETE FROM simulation")
             c.execute("DELETE FROM positions")
             c.execute("DELETE FROM transactions")
             c.execute("DELETE FROM daily_snapshots")
             c.execute(
-                "INSERT INTO simulation (id, cash_balance, total_portfolio_value) VALUES (1, ?, ?)",
+                "INSERT INTO simulation (id, cash_balance, total_portfolio_value, last_advance_date)"
+                " VALUES (1, ?, ?, '')",
+                (initial_capital, initial_capital),
+            )
+
+    def reset_all(self, initial_capital: float = INITIAL_CAPITAL):
+        """Full wipe — clears every table including sp500_stocks, then seeds simulation row."""
+        with self._conn() as c:
+            c.execute("DELETE FROM simulation")
+            c.execute("DELETE FROM positions")
+            c.execute("DELETE FROM transactions")
+            c.execute("DELETE FROM daily_snapshots")
+            c.execute("DELETE FROM sp500_stocks")
+            c.execute(
+                "INSERT INTO simulation (id, cash_balance, total_portfolio_value, last_advance_date)"
+                " VALUES (1, ?, ?, '')",
                 (initial_capital, initial_capital),
             )
 
@@ -216,6 +242,23 @@ class PortfolioDatabase:
     def get_trades(self) -> pd.DataFrame:
         with self._conn() as c:
             return pd.read_sql("SELECT * FROM transactions ORDER BY date, id", c)
+
+    # ── Advance-date gate (prevents multiple advances on the same real day) ──
+    def get_last_advance_date(self) -> str:
+        """Returns the real calendar date when 'Deal Next Hand' was last pressed, or ''."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT last_advance_date FROM simulation WHERE id = 1"
+            ).fetchone()
+            return row["last_advance_date"] if row else ""
+
+    def set_last_advance_date(self, date_str: str):
+        """Persist the real calendar date of the last advance."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE simulation SET last_advance_date = ? WHERE id = 1",
+                (date_str,),
+            )
 
     # ── S&P 500 stock data ───────────────────────────────────────────────────
     def upsert_sp500_stocks(self, df: pd.DataFrame):
