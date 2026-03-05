@@ -69,6 +69,20 @@ class PortfolioDatabase:
                     date         TEXT PRIMARY KEY,
                     total_equity REAL NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS sp500_stocks (
+                    symbol     TEXT NOT NULL,
+                    name       TEXT,
+                    sector     TEXT,
+                    industry   TEXT,
+                    open       REAL,
+                    high       REAL,
+                    low        REAL,
+                    close      REAL,
+                    volume     INTEGER,
+                    fetch_date TEXT NOT NULL,
+                    PRIMARY KEY (symbol, fetch_date)
+                );
             """)
 
     # ── Reset ────────────────────────────────────────────────────────────
@@ -202,3 +216,60 @@ class PortfolioDatabase:
     def get_trades(self) -> pd.DataFrame:
         with self._conn() as c:
             return pd.read_sql("SELECT * FROM transactions ORDER BY date, id", c)
+
+    # ── S&P 500 stock data ───────────────────────────────────────────────────
+    def upsert_sp500_stocks(self, df: pd.DataFrame):
+        """Insert or replace rows in sp500_stocks from a DataFrame."""
+        rows = [
+            (
+                str(r.get("symbol", "")),
+                r.get("name"),
+                r.get("sector"),
+                r.get("industry"),
+                r.get("open"),
+                r.get("high"),
+                r.get("low"),
+                r.get("close"),
+                r.get("volume"),
+                str(r.get("fetch_date", "")),
+            )
+            for r in df.to_dict(orient="records")
+        ]
+        with self._conn() as c:
+            c.executemany(
+                """INSERT OR REPLACE INTO sp500_stocks
+                   (symbol, name, sector, industry, open, high, low, close, volume, fetch_date)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                rows,
+            )
+
+    def get_sp500_stocks(self, fetch_date: str | None = None) -> pd.DataFrame:
+        """
+        Returns the sp500_stocks table for a given date (defaults to most recent).
+        """
+        with self._conn() as c:
+            if fetch_date:
+                return pd.read_sql(
+                    "SELECT * FROM sp500_stocks WHERE fetch_date = ? ORDER BY symbol",
+                    c,
+                    params=(fetch_date,),
+                )
+            # Most recent fetch_date available
+            row = c.execute(
+                "SELECT MAX(fetch_date) AS latest FROM sp500_stocks"
+            ).fetchone()
+            if not row or not row["latest"]:
+                return pd.DataFrame()
+            return pd.read_sql(
+                "SELECT * FROM sp500_stocks WHERE fetch_date = ? ORDER BY symbol",
+                c,
+                params=(row["latest"],),
+            )
+
+    def get_sp500_fetch_dates(self) -> list[str]:
+        """Returns all distinct fetch dates in sp500_stocks, newest first."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT DISTINCT fetch_date FROM sp500_stocks ORDER BY fetch_date DESC"
+            ).fetchall()
+            return [r["fetch_date"] for r in rows]

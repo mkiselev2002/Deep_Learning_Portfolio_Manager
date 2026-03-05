@@ -18,7 +18,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from agents import MarketAnalysisAgent, RiskAgent, TradeProposalAgent
+from agents import DataAgent, StrategyAgent, RiskAgent, ExecutionAgent
 from config import (
     API_KEY,
     CSV_PATH,
@@ -30,6 +30,7 @@ from config import (
     SIMULATION_DAYS,
 )
 from database import PortfolioDatabase
+import market_data as md
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -102,9 +103,10 @@ def run_simulation(
     """
     db.reset(initial_capital)
 
-    analysis_agent = MarketAnalysisAgent()
-    proposal_agent = TradeProposalAgent(strategy)
-    risk_agent     = RiskAgent()
+    data_agent      = DataAgent()
+    strategy_agent  = StrategyAgent(strategy)
+    risk_agent      = RiskAgent()
+    execution_agent = ExecutionAgent(db)
 
     results: dict[str, Any] = {"days": []}
 
@@ -120,32 +122,27 @@ def run_simulation(
         prices    = prices_df.loc[sim_date].to_dict()
         portfolio = db.get_portfolio_state(prices)
 
-        # ── Step 1: Market Analysis ──────────────────────────────────────
-        analysis = analysis_agent.analyze(prices_df, sim_date)
+        # ── Step 1: Data Agent — compute technical indicators ────────────
+        analysis = data_agent.analyze(prices_df, sim_date)
 
-        # ── Step 2: Trade Proposals (LLM or rule-based) ──────────────────
-        proposed = proposal_agent.propose_trades(analysis, portfolio, date_str, day_num)
+        # ── Step 2: Strategy Agent — propose trades ──────────────────────
+        proposed = strategy_agent.propose_trades(analysis, portfolio, date_str, day_num)
 
-        # ── Step 3: Risk Validation ──────────────────────────────────────
+        # ── Step 3: Risk Agent — validate & trim ─────────────────────────
         approved = risk_agent.validate(proposed, portfolio, prices)
 
-        # ── Step 4: Execution ────────────────────────────────────────────
-        for trade in approved:
-            db.execute_trade(trade, date_str)
-
-        # ── Step 5: Record portfolio snapshot ───────────────────────────
-        portfolio_after = db.get_portfolio_state(prices)
-        db.record_portfolio_value(date_str, portfolio_after["total_value"])
+        # ── Step 4: Execution Agent — commit to DB ───────────────────────
+        exec_report = execution_agent.execute(approved, prices, date_str)
 
         results["days"].append({
             "date":            date_str,
             "day_num":         day_num,
-            "portfolio":       portfolio_after,
+            "portfolio":       exec_report["portfolio"],
             "analysis":        analysis,
             "proposed_trades": proposed,
-            "approved_trades": approved,
+            "approved_trades": exec_report["executed_trades"],
             "violations":      risk_agent.violations.copy(),
-            "llm_reasoning":   proposal_agent.reasoning,
+            "llm_reasoning":   strategy_agent.reasoning,
         })
 
         progress_bar.progress((i + 1) / len(sim_dates))
@@ -245,6 +242,117 @@ def chart_signals(analysis: dict[str, dict], strategy: str) -> go.Figure:
 # Main app
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def render_sp500_tab(db: PortfolioDatabase):
+    """Renders the S&P 500 Market Data tab."""
+    st.subheader("S&P 500 Market Data")
+    st.caption(
+        "Fetches all 503 S&P 500 constituents with latest OHLCV prices via yfinance. "
+        "Data is cached in the local database."
+    )
+
+    fetch_dates = db.get_sp500_fetch_dates()
+    col_btn, col_date = st.columns([1, 3])
+
+    with col_btn:
+        fetch_btn = st.button("Fetch / Refresh Data", type="primary", use_container_width=True)
+
+    if fetch_btn:
+        with st.spinner("Downloading S&P 500 prices from Yahoo Finance (may take ~30 s) …"):
+            try:
+                md.fetch_and_store_sp500(db)
+                st.success("Data refreshed successfully.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Failed to fetch data: {exc}")
+                return
+
+    # Re-read dates after potential fetch
+    fetch_dates = db.get_sp500_fetch_dates()
+
+    if not fetch_dates:
+        st.info("No data yet — press **Fetch / Refresh Data** to download today's S&P 500 prices.")
+        return
+
+    with col_date:
+        selected_date = st.selectbox(
+            "Snapshot date",
+            options=fetch_dates,
+            index=0,
+            label_visibility="collapsed",
+        )
+
+    df = db.get_sp500_stocks(selected_date)
+    if df.empty:
+        st.warning("No data found for the selected date.")
+        return
+
+    # ── Computed columns ──────────────────────────────────────────────────────
+    df["change_pct"] = ((df["close"] - df["open"]) / df["open"] * 100).round(2)
+
+    # ── Summary metrics ───────────────────────────────────────────────────────
+    total = len(df)
+    gainers = int((df["change_pct"] > 0).sum())
+    losers  = int((df["change_pct"] < 0).sum())
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Stocks",  str(total))
+    m2.metric("Gainers",       str(gainers),  delta=f"+{gainers}")
+    m3.metric("Losers",        str(losers),   delta=f"-{losers}", delta_color="inverse")
+    m4.metric("Snapshot Date", selected_date)
+
+    st.divider()
+
+    # ── Filters ───────────────────────────────────────────────────────────────
+    fc1, fc2, fc3 = st.columns([2, 1, 1])
+    with fc1:
+        search = st.text_input("Search by symbol or company name", placeholder="e.g. AAPL or Apple")
+    with fc2:
+        sectors = ["All Sectors"] + sorted(df["sector"].dropna().unique().tolist())
+        sector_filter = st.selectbox("Sector", options=sectors)
+    with fc3:
+        direction = st.selectbox("Direction", ["All", "Gainers only", "Losers only"])
+
+    filtered = df.copy()
+    if search:
+        q = search.upper()
+        filtered = filtered[
+            filtered["symbol"].str.upper().str.contains(q, na=False)
+            | filtered["name"].str.upper().str.contains(q, na=False)
+        ]
+    if sector_filter != "All Sectors":
+        filtered = filtered[filtered["sector"] == sector_filter]
+    if direction == "Gainers only":
+        filtered = filtered[filtered["change_pct"] > 0]
+    elif direction == "Losers only":
+        filtered = filtered[filtered["change_pct"] < 0]
+
+    st.caption(f"Showing {len(filtered)} of {total} stocks")
+
+    # ── Display table ─────────────────────────────────────────────────────────
+    display = filtered[["symbol", "name", "sector", "open", "high", "low", "close", "change_pct", "volume"]].copy()
+    display.columns = ["Symbol", "Company", "Sector", "Open", "High", "Low", "Close", "Change %", "Volume"]
+
+    def _style_change(val):
+        if pd.isna(val):
+            return ""
+        return "color:#10b981; font-weight:bold" if val > 0 else ("color:#ef553b; font-weight:bold" if val < 0 else "")
+
+    styled = (
+        display.style
+        .map(_style_change, subset=["Change %"])
+        .format({
+            "Open":     lambda v: f"${v:.2f}" if pd.notna(v) else "—",
+            "High":     lambda v: f"${v:.2f}" if pd.notna(v) else "—",
+            "Low":      lambda v: f"${v:.2f}" if pd.notna(v) else "—",
+            "Close":    lambda v: f"${v:.2f}" if pd.notna(v) else "—",
+            "Change %": lambda v: f"{v:+.2f}%" if pd.notna(v) else "—",
+            "Volume":   lambda v: f"{int(v):,}" if pd.notna(v) else "—",
+        })
+    )
+
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=600)
+
+
 def main():
     ensure_data_exists()
 
@@ -320,218 +428,218 @@ def main():
         "**Trade Proposal** (Claude LLM) → **Risk Validation**."
     )
 
-    # ── Reset action ─────────────────────────────────────────────────────────
-    if reset_btn:
-        db.reset(initial_capital)
-        st.session_state.pop("sim_results", None)
-        st.session_state.pop("sim_capital", None)
-        st.rerun()
+    tab_sim, tab_market = st.tabs(["Paper Trading Simulation", "S&P 500 Market Data"])
 
-    # ── Run simulation ───────────────────────────────────────────────────────
-    if run_btn and sim_dates:
-        st.markdown("---")
-        progress_bar = st.progress(0, "Initialising …")
-        status_box   = st.empty()
+    with tab_market:
+        render_sp500_tab(db)
 
-        try:
-            results = run_simulation(
-                prices_df, sim_dates, strategy,
-                initial_capital, db, progress_bar, status_box,
-            )
-        except Exception as exc:
+    with tab_sim:
+        # ── Reset action ──────────────────────────────────────────────────────
+        if reset_btn:
+            db.reset(initial_capital)
+            st.session_state.pop("sim_results", None)
+            st.session_state.pop("sim_capital", None)
+            st.rerun()
+
+        # ── Run simulation ────────────────────────────────────────────────────
+        if run_btn and sim_dates:
+            st.markdown("---")
+            progress_bar = st.progress(0, "Initialising …")
+            status_box   = st.empty()
+
+            try:
+                results = run_simulation(
+                    prices_df, sim_dates, strategy,
+                    initial_capital, db, progress_bar, status_box,
+                )
+            except Exception as exc:
+                progress_bar.empty()
+                status_box.error(f"Simulation error: {exc}")
+                st.stop()
+
             progress_bar.empty()
-            status_box.error(f"Simulation error: {exc}")
-            st.stop()
+            st.session_state["sim_results"]  = results
+            st.session_state["sim_capital"]  = initial_capital
+            st.session_state["sim_strategy"] = strategy
+            st.session_state["sim_dates"]    = [d.strftime("%Y-%m-%d") for d in sim_dates]
+            st.rerun()
 
-        progress_bar.empty()
-        st.session_state["sim_results"]  = results
-        st.session_state["sim_capital"]  = initial_capital
-        st.session_state["sim_strategy"] = strategy
-        st.session_state["sim_dates"]    = [d.strftime("%Y-%m-%d") for d in sim_dates]
-        st.rerun()
+        # ── Results display ───────────────────────────────────────────────────
+        history_df = db.get_portfolio_history()
 
-    # ── Results display ──────────────────────────────────────────────────────
-    history_df = db.get_portfolio_history()
+        if history_df.empty:
+            st.info("Configure the parameters in the sidebar and press **Run Simulation**.")
 
-    if history_df.empty:
-        st.info("Configure the parameters in the sidebar and press **Run Simulation**.")
+            st.subheader("ETF Universe — Latest Prices")
+            latest = prices_df[ETF_TICKERS].tail(10).copy()
+            st.dataframe(
+                latest.style.format("${:.2f}"),
+                use_container_width=True,
+                height=320,
+            )
 
-        st.subheader("ETF Universe — Latest Prices")
-        latest = prices_df[ETF_TICKERS].tail(10).copy()
-        st.dataframe(
-            latest.style.format("${:.2f}"),
-            use_container_width=True,
-            height=320,
-        )
-        return
+        else:
+            # ── KPI row ───────────────────────────────────────────────────────
+            init_cap     = st.session_state.get("sim_capital", initial_capital)
+            strategy_lbl = st.session_state.get("sim_strategy", strategy)
 
-    # ── KPI row ───────────────────────────────────────────────────────────────
-    init_cap     = st.session_state.get("sim_capital", initial_capital)
-    strategy_lbl = st.session_state.get("sim_strategy", strategy)
+            final_val  = history_df["total_equity"].iloc[-1]
+            pnl        = final_val - init_cap
+            pnl_pct    = pnl / init_cap * 100.0
+            max_val    = history_df["total_equity"].max()
+            drawdown   = (max_val - history_df["total_equity"].min()) / max_val * 100.0
+            num_trades = len(db.get_trades())
 
-    final_val  = history_df["total_equity"].iloc[-1]
-    pnl        = final_val - init_cap
-    pnl_pct    = pnl / init_cap * 100.0
-    max_val    = history_df["total_equity"].max()
-    drawdown   = (max_val - history_df["total_equity"].min()) / max_val * 100.0
-    num_trades = len(db.get_trades())
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Total Value",     f"${final_val:,.2f}",  delta=f"${pnl:+,.2f}")
+            c2.metric("Total Return",    f"{pnl_pct:+.2f}%")
+            c3.metric("Peak Value",      f"${max_val:,.2f}")
+            c4.metric("Max Drawdown",    f"{drawdown:.2f}%")
+            c5.metric("Trades Executed", str(num_trades))
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total Value",     f"${final_val:,.2f}",  delta=f"${pnl:+,.2f}")
-    c2.metric("Total Return",    f"{pnl_pct:+.2f}%")
-    c3.metric("Peak Value",      f"${max_val:,.2f}")
-    c4.metric("Max Drawdown",    f"{drawdown:.2f}%")
-    c5.metric("Trades Executed", str(num_trades))
+            st.divider()
 
-    st.divider()
+            # ── Main charts ───────────────────────────────────────────────────
+            col_main, col_side = st.columns([2, 1])
 
-    # ── Main charts ───────────────────────────────────────────────────────────
-    col_main, col_side = st.columns([2, 1])
+            with col_main:
+                fig_val = chart_portfolio_value(history_df, init_cap)
+                st.plotly_chart(fig_val, use_container_width=True)
 
-    with col_main:
-        fig_val = chart_portfolio_value(history_df, init_cap)
-        st.plotly_chart(fig_val, use_container_width=True)
+            with col_side:
+                results       = st.session_state.get("sim_results")
+                sim_date_strs = st.session_state.get("sim_dates", [])
 
-    with col_side:
-        results      = st.session_state.get("sim_results")
-        sim_date_strs = st.session_state.get("sim_dates", [])
+                if results and sim_date_strs:
+                    last_date    = pd.Timestamp(sim_date_strs[-1])
+                    final_prices = prices_df.loc[last_date].to_dict()
+                    final_port   = db.get_portfolio_state(final_prices)
+                    fig_alloc    = chart_allocation(final_port, final_val)
+                    st.plotly_chart(fig_alloc, use_container_width=True)
 
-        if results and sim_date_strs:
-            last_date    = pd.Timestamp(sim_date_strs[-1])
-            final_prices = prices_df.loc[last_date].to_dict()
-            final_port   = db.get_portfolio_state(final_prices)
-            fig_alloc    = chart_allocation(final_port, final_val)
-            st.plotly_chart(fig_alloc, use_container_width=True)
+            st.divider()
 
-    st.divider()
+            # ── Trade history ─────────────────────────────────────────────────
+            st.subheader("Trade History")
+            trades_df = db.get_trades()
 
-    # ── Trade history ─────────────────────────────────────────────────────────
-    st.subheader("Trade History")
-    trades_df = db.get_trades()
+            if trades_df.empty:
+                st.info("No trades were executed during this simulation.")
+            else:
+                def _style_action(val):
+                    return "color:#10b981; font-weight:bold" if val == "BUY" else "color:#ef553b; font-weight:bold"
 
-    if trades_df.empty:
-        st.info("No trades were executed during this simulation.")
-    else:
-        def _style_action(val):
-            return "color:#10b981; font-weight:bold" if val == "BUY" else "color:#ef553b; font-weight:bold"
+                display = trades_df[["date", "symbol", "action", "shares", "price", "reason"]].copy()
+                display["price"] = display["price"].map("${:.2f}".format)
+                st.dataframe(
+                    display.style.map(_style_action, subset=["action"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
-        display = trades_df[["date", "symbol", "action", "shares", "price", "reason"]].copy()
-        display["price"] = display["price"].map("${:.2f}".format)
-        st.dataframe(
-            display.style.map(_style_action, subset=["action"]),
-            use_container_width=True,
-            hide_index=True,
-        )
+            st.divider()
 
-    st.divider()
+            # ── Day-by-day expanders ──────────────────────────────────────────
+            if results:
+                st.subheader("Daily Agent Activity")
 
-    # ── Day-by-day expanders ──────────────────────────────────────────────────
-    if results:
-        st.subheader("Daily Agent Activity")
+                for day in results["days"]:
+                    badge = f"✅  {len(day['approved_trades'])} trade(s)" if day["approved_trades"] else "— no trades"
+                    with st.expander(f"Day {day['day_num']}  •  {day['date']}  •  {badge}"):
+                        left, right = st.columns([3, 2])
 
-        for day in results["days"]:
-            badge = f"✅  {len(day['approved_trades'])} trade(s)" if day["approved_trades"] else "— no trades"
-            with st.expander(f"Day {day['day_num']}  •  {day['date']}  •  {badge}"):
-                left, right = st.columns([3, 2])
+                        with left:
+                            st.markdown("**Market Analysis**")
+                            rows = []
+                            for t, m in day["analysis"].items():
+                                rows.append({
+                                    "ETF":       t,
+                                    "Price":     f"${m['price']:.2f}",
+                                    "Mom 20d":   f"{m['momentum_20d']:+.2f}%",
+                                    "Mom 5d":    f"{m['momentum_5d']:+.2f}%",
+                                    "Z-Score":   f"{m['zscore']:+.3f}",
+                                    "RSI":       f"{m['rsi']:.1f}",
+                                    "vs SMA20":  "▲" if m["above_sma20"] else "▼",
+                                })
+                            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+                            st.plotly_chart(
+                                chart_signals(day["analysis"], strategy_lbl),
+                                use_container_width=True,
+                            )
 
-                # ── Analysis table ────────────────────────────────────────
-                with left:
-                    st.markdown("**Market Analysis**")
+                        with right:
+                            st.markdown("**Trade Proposals & Decisions**")
+                            approved_keys = {
+                                (t["ticker"], t["action"]) for t in day["approved_trades"]
+                            }
+                            for prop in day["proposed_trades"]:
+                                key     = (prop["ticker"], prop["action"])
+                                icon    = "🟢" if prop["action"] == "BUY" else "🔴"
+                                verdict = "✅ approved" if key in approved_keys else "❌ rejected"
+                                st.markdown(
+                                    f"{icon} **{prop['action']} {prop['ticker']}** &nbsp; {verdict}"
+                                )
+                                st.caption(prop.get("reasoning", ""))
+
+                            if not day["proposed_trades"]:
+                                st.info("No trades proposed today.")
+
+                            if day["violations"]:
+                                st.markdown("**Risk Agent messages**")
+                                for v in day["violations"]:
+                                    st.warning(v, icon="⚠️")
+
+                            st.markdown("**End-of-Day Portfolio**")
+                            snap = day["portfolio"]
+                            port_rows = [{"Item": "Cash", "Value": f"${snap['cash']:,.2f}", "Weight": "—"}]
+                            for t, pos in snap["positions"].items():
+                                w = pos["value"] / snap["total_value"] * 100
+                                port_rows.append({
+                                    "Item":   t,
+                                    "Value":  f"${pos['value']:,.2f}",
+                                    "Weight": f"{w:.1f}%",
+                                })
+                            port_rows.append({
+                                "Item":   "TOTAL",
+                                "Value":  f"${snap['total_value']:,.2f}",
+                                "Weight": "100%",
+                            })
+                            st.dataframe(pd.DataFrame(port_rows), hide_index=True, use_container_width=True)
+
+                            if day.get("llm_reasoning"):
+                                with st.popover("View raw LLM output"):
+                                    st.code(day["llm_reasoning"], language="json")
+
+            st.divider()
+
+            # ── Final positions ───────────────────────────────────────────────
+            st.subheader("Final Positions")
+            sim_date_strs2 = st.session_state.get("sim_dates", [])
+            if sim_date_strs2:
+                last_date2    = pd.Timestamp(sim_date_strs2[-1])
+                final_prices2 = prices_df.loc[last_date2].to_dict()
+                final_port2   = db.get_portfolio_state(final_prices2)
+
+                if final_port2["positions"]:
                     rows = []
-                    for t, m in day["analysis"].items():
+                    for t, p in final_port2["positions"].items():
                         rows.append({
-                            "ETF":       t,
-                            "Price":     f"${m['price']:.2f}",
-                            "Mom 20d":   f"{m['momentum_20d']:+.2f}%",
-                            "Mom 5d":    f"{m['momentum_5d']:+.2f}%",
-                            "Z-Score":   f"{m['zscore']:+.3f}",
-                            "RSI":       f"{m['rsi']:.1f}",
-                            "vs SMA20":  "▲" if m["above_sma20"] else "▼",
+                            "ETF":           t,
+                            "Shares":        p["shares"],
+                            "Avg Cost":      f"${p['average_cost']:.2f}",
+                            "Current Price": f"${p['current_price']:.2f}",
+                            "Market Value":  f"${p['value']:,.2f}",
+                            "Weight":        f"{p['value']/final_port2['total_value']*100:.1f}%",
+                            "P&L":           f"{p['pnl_pct']:+.2f}%",
                         })
                     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+                else:
+                    st.info(f"No open positions.  Cash: ${final_port2['cash']:,.2f}")
 
-                    # Signal bar chart
-                    st.plotly_chart(
-                        chart_signals(day["analysis"], strategy_lbl),
-                        use_container_width=True,
-                    )
-
-                # ── Agent decisions ───────────────────────────────────────
-                with right:
-                    st.markdown("**Trade Proposals & Decisions**")
-                    approved_keys = {
-                        (t["ticker"], t["action"]) for t in day["approved_trades"]
-                    }
-                    for prop in day["proposed_trades"]:
-                        key      = (prop["ticker"], prop["action"])
-                        icon     = "🟢" if prop["action"] == "BUY" else "🔴"
-                        verdict  = "✅ approved" if key in approved_keys else "❌ rejected"
-                        st.markdown(
-                            f"{icon} **{prop['action']} {prop['ticker']}** &nbsp; {verdict}"
-                        )
-                        st.caption(prop.get("reasoning", ""))
-
-                    if not day["proposed_trades"]:
-                        st.info("No trades proposed today.")
-
-                    if day["violations"]:
-                        st.markdown("**Risk Agent messages**")
-                        for v in day["violations"]:
-                            st.warning(v, icon="⚠️")
-
-                    # Portfolio snapshot
-                    st.markdown("**End-of-Day Portfolio**")
-                    snap = day["portfolio"]
-                    port_rows = [{"Item": "Cash", "Value": f"${snap['cash']:,.2f}", "Weight": "—"}]
-                    for t, pos in snap["positions"].items():
-                        w = pos["value"] / snap["total_value"] * 100
-                        port_rows.append({
-                            "Item":   t,
-                            "Value":  f"${pos['value']:,.2f}",
-                            "Weight": f"{w:.1f}%",
-                        })
-                    port_rows.append({
-                        "Item":   "TOTAL",
-                        "Value":  f"${snap['total_value']:,.2f}",
-                        "Weight": "100%",
-                    })
-                    st.dataframe(pd.DataFrame(port_rows), hide_index=True, use_container_width=True)
-
-                    # LLM raw output (collapsible)
-                    if day.get("llm_reasoning"):
-                        with st.popover("View raw LLM output"):
-                            st.code(day["llm_reasoning"], language="json")
-
-    st.divider()
-
-    # ── Final positions ───────────────────────────────────────────────────────
-    st.subheader("Final Positions")
-    sim_date_strs2 = st.session_state.get("sim_dates", [])
-    if sim_date_strs2:
-        last_date2   = pd.Timestamp(sim_date_strs2[-1])
-        final_prices2 = prices_df.loc[last_date2].to_dict()
-        final_port2   = db.get_portfolio_state(final_prices2)
-
-        if final_port2["positions"]:
-            rows = []
-            for t, p in final_port2["positions"].items():
-                rows.append({
-                    "ETF":           t,
-                    "Shares":        p["shares"],
-                    "Avg Cost":      f"${p['average_cost']:.2f}",
-                    "Current Price": f"${p['current_price']:.2f}",
-                    "Market Value":  f"${p['value']:,.2f}",
-                    "Weight":        f"{p['value']/final_port2['total_value']*100:.1f}%",
-                    "P&L":           f"{p['pnl_pct']:+.2f}%",
-                })
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-        else:
-            st.info(f"No open positions.  Cash: ${final_port2['cash']:,.2f}")
-
-    st.caption(
-        "Simulation uses synthetic ETF data (correlated GBM model).  "
-        "AI proposals are generated by Claude (Anthropic).  Not financial advice."
-    )
+            st.caption(
+                "Simulation uses synthetic ETF data (correlated GBM model).  "
+                "AI proposals are generated by Claude (Anthropic).  Not financial advice."
+            )
 
 
 if __name__ == "__main__":
