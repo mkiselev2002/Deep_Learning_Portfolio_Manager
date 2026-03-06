@@ -41,46 +41,64 @@ st.set_page_config(
     page_title="The Trading Floor",
     page_icon="🎰",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 st.markdown("""
 <style>
 /* ── Layout ── */
-.block-container { padding-top: 1rem; padding-bottom: 2rem; }
+.block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
 
-/* ── Metric labels – gold uppercase ── */
-[data-testid="stMetricLabel"] p {
-    color: #f59e0b !important;
-    font-size: 0.68rem !important;
-    font-weight: 800 !important;
-    text-transform: uppercase !important;
-    letter-spacing: 0.14em !important;
-}
-[data-testid="stMetricValue"] {
-    font-family: 'Courier New', monospace !important;
-    font-size: 1.7rem !important;
-    font-weight: 900 !important;
-}
-[data-testid="stMetricDelta"] svg { display: none; }
+/* ── Kill the sidebar entirely ── */
+section[data-testid="stSidebar"]          { display: none !important; }
+[data-testid="stSidebarCollapseButton"]   { display: none !important; }
+[data-testid="collapsedControl"]          { display: none !important; }
 
-/* ── Sidebar ── */
-section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #080d14 0%, #0c1520 100%) !important;
-    border-right: 1px solid rgba(245,158,11,0.25) !important;
+/* ── Control strip separators ── */
+.ctrl-top-border {
+    height: 2px;
+    background: linear-gradient(90deg,
+        transparent 0%, rgba(245,158,11,0.5) 20%,
+        rgba(245,158,11,0.9) 50%, rgba(245,158,11,0.5) 80%, transparent 100%);
+    margin: 0.6rem 0 0 0;
+    border-radius: 1px;
 }
-section[data-testid="stSidebar"] .stButton button {
-    font-weight: 800 !important;
-    text-transform: uppercase !important;
-    letter-spacing: 0.1em !important;
+.ctrl-bottom-border {
+    height: 1px;
+    background: linear-gradient(90deg,
+        transparent 0%, rgba(245,158,11,0.25) 30%,
+        rgba(245,158,11,0.25) 70%, transparent 100%);
+    margin: 0.4rem 0 0.2rem 0;
 }
 
-/* ── Tabs ── */
+/* ── Tabs — evenly spaced big buttons ── */
+[data-testid="stTabs"] [role="tablist"] {
+    gap: 0 !important;
+    border-bottom: 1px solid rgba(245,158,11,0.18) !important;
+}
+button[data-baseweb="tab"] {
+    flex: 1 1 0 !important;
+    justify-content: center !important;
+    padding: 0.75rem 1rem !important;
+    background: rgba(255,255,255,0.02) !important;
+    border-radius: 0 !important;
+    border-right: 1px solid rgba(245,158,11,0.10) !important;
+    transition: background 0.15s !important;
+}
+button[data-baseweb="tab"]:hover {
+    background: rgba(245,158,11,0.07) !important;
+}
 button[data-baseweb="tab"] p {
     font-weight: 800 !important;
     text-transform: uppercase !important;
-    letter-spacing: 0.1em !important;
-    font-size: 0.78rem !important;
+    letter-spacing: 0.12em !important;
+    font-size: 0.82rem !important;
+    color: #9ca3af !important;
+    text-align: center !important;
+}
+[data-testid="stTabs"] [aria-selected="true"] {
+    background: rgba(245,158,11,0.10) !important;
+    border-bottom: 3px solid #f59e0b !important;
 }
 [data-testid="stTabs"] [aria-selected="true"] p { color: #f59e0b !important; }
 
@@ -92,6 +110,14 @@ hr { border-color: rgba(245,158,11,0.18) !important; }
 
 /* ── DataFrames ── */
 [data-testid="stDataFrame"] { border: 1px solid rgba(245,158,11,0.15) !important; }
+
+/* ── Card containers (st.container border=True) ── */
+[data-testid="stVerticalBlockBorderWrapper"] {
+    background: rgba(255,255,255,0.025) !important;
+    border: 1px solid rgba(245,158,11,0.22) !important;
+    border-radius: 12px !important;
+    padding: 0.2rem 0.4rem !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -105,6 +131,43 @@ def _ordinal(n: int) -> str:
     if 11 <= (n % 100) <= 13:          # special cases: 11th, 12th, 13th
         return f"{n}th"
     return f"{n}{['th','st','nd','rd','th','th','th','th','th','th'][n % 10]}"
+
+
+def _html_metric(label: str, value: str, delta: str | None = None,
+                 delta_positive: bool | None = None) -> str:
+    """
+    Return an HTML string for a metric card with inline delta.
+
+    delta_positive:
+        True  → green  (#10b981)
+        False → red    (#ef4444)
+        None  → gold   (#f59e0b)  — used when change = 0 or delta is omitted
+    """
+    if delta_positive is True:
+        delta_color = "#10b981"
+    elif delta_positive is False:
+        delta_color = "#ef4444"
+    else:
+        delta_color = "#f59e0b"
+
+    delta_html = ""
+    if delta is not None:
+        delta_html = (
+            f"<span style='font-size:0.82rem; font-weight:700; color:{delta_color}; "
+            f"margin-left:0.5rem; white-space:nowrap;'>{delta}</span>"
+        )
+
+    return (
+        f"<div style='padding:0.55rem 0.1rem;'>"
+        f"<div style='font-size:0.65rem; font-weight:800; text-transform:uppercase; "
+        f"letter-spacing:0.14em; color:#f59e0b; margin-bottom:0.25rem;'>{label}</div>"
+        f"<div style='display:flex; align-items:baseline; flex-wrap:wrap; gap:0;'>"
+        f"<span style='font-family:\"Courier New\",monospace; font-size:1.65rem; "
+        f"font-weight:900; color:#f1f5f9; line-height:1;'>{value}</span>"
+        f"{delta_html}"
+        f"</div>"
+        f"</div>"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -154,6 +217,144 @@ def run_single_day(
         "violations":      risk_agent.violations.copy(),
         "llm_reasoning":   strategy_agent.reasoning,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Trade Proposals Dialog
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@st.dialog("📋  Proposed Trades — Confirm to Execute", width="large")
+def show_proposals_dialog(db: "PortfolioDatabase", today_str: str) -> None:
+    """
+    Modal dialog that shows the proposed trades for the current simulation day
+    and lets the user confirm or cancel execution.
+    """
+    data      = st.session_state["pending_day_data"]
+    proposals = data["proposals"]
+    analysis  = data["analysis"]
+    portfolio = data["portfolio"]
+    sim_date  = data["sim_date"]
+    day_num   = data["day_num"]
+    date_str  = sim_date.strftime("%Y-%m-%d")
+    total_val = portfolio["total_value"]
+
+    # ── API failure banner ────────────────────────────────────────────────────
+    if data.get("api_failed"):
+        st.error(
+            f"**⚠️ Claude API unavailable** — trades were generated using the "
+            f"deterministic fallback (same strategy logic, no AI reasoning).\n\n"
+            f"**Error:** `{data.get('api_error', 'unknown error')}`",
+            icon="🤖",
+        )
+    elif API_KEY:
+        st.success("Trades proposed by Claude AI", icon="🤖")
+
+    st.markdown(
+        f"**Day {day_num}  ·  Market date: {date_str}**  "
+        f"— Portfolio value: **${total_val:,.0f}**",
+    )
+
+    sells = [p for p in proposals if p["action"] == "SELL"]
+    buys  = [p for p in proposals if p["action"] == "BUY"]
+
+    # ── Liquidation block ─────────────────────────────────────────────────────
+    if sells:
+        st.markdown("#### 🔴  Liquidate positions")
+        sell_rows = []
+        for p in sells:
+            pos   = portfolio.get("positions", {}).get(p["ticker"], {})
+            price = analysis.get(p["ticker"], {}).get("price", 0.0)
+            val   = pos.get("value", 0.0)
+            pnl   = pos.get("pnl_pct", 0.0)
+            sell_rows.append({
+                "Ticker":          p["ticker"],
+                "Current Price":   f"${price:,.2f}",
+                "Position Value":  f"${val:,.0f}",
+                "P&L":             f"{pnl:+.2f}%",
+            })
+        st.dataframe(
+            sell_rows,
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("No positions to liquidate — fully in cash.", icon="💵")
+
+    # ── New buys block ────────────────────────────────────────────────────────
+    if buys:
+        st.markdown("#### 🟢  New positions (equal-weight, 20% each)")
+        buy_rows = []
+        for p in buys:
+            m     = analysis.get(p["ticker"], {})
+            price = m.get("price", 0.0)
+            vol   = m.get("realized_vol_5d", 0.0)
+            chg   = m.get("prev_day_return", 0.0)
+            amt   = total_val * 0.20
+            buy_rows.append({
+                "Ticker":             p["ticker"],
+                "Price":              f"${price:,.2f}",
+                "5d Realised Vol":    f"{vol:.1%}",
+                "Prev Day Change":    f"{chg:+.2f}%",
+                "Amount to Invest":   f"${amt:,.0f}",
+            })
+        st.dataframe(
+            buy_rows,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            "Strategy: Top-50 S&P 500 stocks by 5-day realised volatility, "
+            "then the 5 with the largest previous-day loss."
+        )
+    else:
+        st.warning("No buy candidates found in analysis data.", icon="⚠️")
+
+    # ── Agent reasoning ───────────────────────────────────────────────────────
+    reasoning = data.get("reasoning", "")
+    if reasoning:
+        st.caption(f"🧠 **Agent:** {reasoning}")
+
+    st.divider()
+
+    col_confirm, col_cancel = st.columns(2)
+
+    with col_confirm:
+        if st.button("✅  Execute Trades", type="primary", use_container_width=True):
+            prices    = data["prices"]
+            prices_df = load_price_data()
+
+            risk_agent      = RiskAgent()
+            portfolio_fresh = db.get_portfolio_state(prices)
+            approved        = risk_agent.validate(proposals, portfolio_fresh, prices)
+
+            execution_agent = ExecutionAgent(db)
+            exec_report     = execution_agent.execute(approved, prices, date_str)
+
+            result = {
+                "date":            date_str,
+                "day_num":         day_num,
+                "portfolio":       exec_report["portfolio"],
+                "analysis":        analysis,
+                "proposed_trades": proposals,
+                "approved_trades": exec_report["executed_trades"],
+                "violations":      risk_agent.violations.copy(),
+                "llm_reasoning":   data["reasoning"],
+            }
+
+            db.save_day_result(result)
+            db.set_last_advance_date(today_str)
+            st.session_state["daily_results"].append(result)
+            st.session_state["sim_date_idx"] += 1
+            st.session_state["sim_day_num"]  += 1
+            st.session_state["report_date"]   = ""   # force report refresh
+            st.session_state["pending_day_data"] = None
+            st.rerun()
+
+    with col_cancel:
+        if st.button("❌  Cancel", use_container_width=True):
+            st.session_state["pending_day_data"] = None
+            st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -218,10 +419,264 @@ def chart_allocation(portfolio: dict) -> go.Figure:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# vs S&P 500 performance helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=3_600, show_spinner=False)
+def _load_spy_prices(start: str, end: str) -> pd.Series:
+    """Fetch SPY adjusted close prices for [start-10d, end+3d]; empty on failure."""
+    import yfinance as yf
+    try:
+        buf_s = (pd.Timestamp(start) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+        buf_e = (pd.Timestamp(end)   + pd.Timedelta(days=3)).strftime("%Y-%m-%d")
+        raw   = yf.download("SPY", start=buf_s, end=buf_e,
+                             auto_adjust=True, progress=False, threads=False)
+        if raw.empty:
+            return pd.Series(dtype=float, name="SPY")
+        col = raw["Close"]
+        return (col.iloc[:, 0] if isinstance(col, pd.DataFrame) else col).squeeze().rename("SPY")
+    except Exception:
+        return pd.Series(dtype=float, name="SPY")
+
+
+def _perf_metrics(
+    port:    pd.Series,
+    spy:     pd.Series,
+    initial: float,
+    rf_ann:  float = 0.05,
+) -> dict:
+    """
+    Compute risk-adjusted performance metrics (portfolio vs SPY).
+    Returns dict with 'ok' flag and all stat fields (NaN when < 2 data points).
+    """
+    TD  = 252
+    rf  = (1 + rf_ann) ** (1 / TD) - 1
+    nan = float("nan")
+
+    spy_a = spy.reindex(port.index, method="ffill").dropna()
+    idx   = port.index.intersection(spy_a.index)
+    if len(idx) < 1:
+        return {"ok": False}
+
+    p, s       = port.loc[idx], spy_a.loc[idx]
+    port_total = (p.iloc[-1] / initial  - 1) * 100
+    spy_total  = (s.iloc[-1] / s.iloc[0] - 1) * 100
+
+    pr_raw = p.pct_change().dropna()
+    sr_raw = s.pct_change().dropna()
+    n      = min(len(pr_raw), len(sr_raw))
+
+    base = {"ok": True, "n": n, "port_total": port_total, "spy_total": spy_total}
+    _na  = dict.fromkeys([
+        "port_ann", "spy_ann", "port_vol", "spy_vol",
+        "sharpe", "spy_sharpe", "sortino",
+        "beta", "alpha", "treynor",
+        "max_dd", "spy_max_dd",
+        "info_ratio", "win_rate", "calmar",
+    ], nan)
+
+    if n < 1:
+        return {**base, **_na}
+
+    pr = pd.Series(pr_raw.values[:n])
+    sr = pd.Series(sr_raw.values[:n])
+
+    def _sd(v): return float("nan") if abs(v) < 1e-12 or pd.isna(v) else v
+
+    port_ann = ((1 + pr.mean()) ** TD - 1) * 100
+    spy_ann  = ((1 + sr.mean()) ** TD - 1) * 100
+
+    if n >= 2:
+        port_vol   = pr.std(ddof=1) * TD**0.5 * 100
+        spy_vol    = sr.std(ddof=1) * TD**0.5 * 100
+        sharpe     = (pr - rf).mean() / (pr.std(ddof=1) + 1e-12) * TD**0.5
+        spy_sharpe = (sr - rf).mean() / (sr.std(ddof=1) + 1e-12) * TD**0.5
+
+        dn       = pr[pr < rf]
+        dn_std   = dn.std(ddof=1) if len(dn) > 1 else (abs(dn.iloc[0]) if len(dn) == 1 else 1e-12)
+        sortino  = (pr.mean() - rf) / (dn_std + 1e-12) * TD**0.5
+
+        beta     = _sd(pr.cov(sr) / (sr.var(ddof=1) + 1e-12))
+        alpha_d  = pr.mean() - rf - beta * (sr.mean() - rf) if not pd.isna(beta) else nan
+        alpha    = ((1 + alpha_d) ** TD - 1) * 100 if not pd.isna(alpha_d) else nan
+        treynor  = _sd((port_ann / 100 - rf_ann) / (abs(beta) + 1e-12)) if not pd.isna(beta) else nan
+
+        cum     = (1 + pr).cumprod()
+        max_dd  = ((cum - cum.cummax()) / (cum.cummax() + 1e-12)).min() * 100
+        scum    = (1 + sr).cumprod()
+        spy_mdd = ((scum - scum.cummax()) / (scum.cummax() + 1e-12)).min() * 100
+
+        act        = pd.Series(pr.values - sr.values)
+        info_ratio = act.mean() / (act.std(ddof=1) + 1e-12) * TD**0.5
+        win_rate   = (pr > 0).mean() * 100
+        calmar     = _sd(port_ann / (abs(max_dd) + 1e-12)) if not pd.isna(max_dd) else nan
+    else:
+        port_vol = spy_vol = sharpe = spy_sharpe = sortino = nan
+        beta = alpha = treynor = max_dd = spy_mdd = nan
+        info_ratio = win_rate = calmar = nan
+
+    return {
+        **base,
+        "port_ann": port_ann, "spy_ann": spy_ann,
+        "port_vol": port_vol, "spy_vol": spy_vol,
+        "sharpe":   sharpe,   "spy_sharpe": spy_sharpe,
+        "sortino":  sortino,
+        "beta":     beta,     "alpha":    alpha,  "treynor": treynor,
+        "max_dd":   max_dd,   "spy_max_dd": spy_mdd,
+        "info_ratio": info_ratio, "win_rate": win_rate, "calmar": calmar,
+    }
+
+
+def _render_vs_sp500(daily_results: list[dict]) -> None:
+    """Renders the portfolio-vs-S&P-500 performance comparison widget."""
+    dates  = [pd.Timestamp(r["date"]) for r in daily_results]
+    values = [r["portfolio"]["total_value"] for r in daily_results]
+    port   = pd.Series(values, index=pd.DatetimeIndex(dates), name="Portfolio")
+
+    spy_raw = _load_spy_prices(daily_results[0]["date"], daily_results[-1]["date"])
+
+    # ── Section header ────────────────────────────────────────────────────────
+    nd    = len(daily_results)
+    d_rng = (f"{daily_results[0]['date']} → {daily_results[-1]['date']}"
+             if nd > 1 else daily_results[0]["date"])
+    st.markdown(
+        f"<div style='font-size:0.65rem; font-weight:800; text-transform:uppercase; "
+        f"letter-spacing:0.12em; color:#f59e0b; margin-bottom:0.4rem;'>"
+        f"📊 Portfolio vs S&P 500 (SPY)  ·  {nd} Day{'s' if nd != 1 else ''}  ·  {d_rng}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Cumulative return chart ───────────────────────────────────────────────
+    t0       = dates[0] - pd.Timedelta(days=1)
+    port_ext = pd.Series(
+        [INITIAL_CAPITAL] + values,
+        index=pd.DatetimeIndex([t0] + dates),
+        name="Portfolio",
+    )
+    port_norm = port_ext / INITIAL_CAPITAL * 100
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=port_norm.index, y=port_norm.values,
+        name="Portfolio", mode="lines+markers",
+        line=dict(color="#f59e0b", width=2.5),
+        marker=dict(size=7, color="#f59e0b"),
+        fill="tozeroy", fillcolor="rgba(245,158,11,0.06)",
+    ))
+    if not spy_raw.empty:
+        spy_a = spy_raw.reindex(port_ext.index, method="ffill").dropna()
+        if len(spy_a) >= 1:
+            spy_norm = spy_a / spy_a.iloc[0] * 100
+            fig.add_trace(go.Scatter(
+                x=spy_norm.index, y=spy_norm.values,
+                name="S&P 500 (SPY)", mode="lines+markers",
+                line=dict(color="#60a5fa", width=2, dash="dot"),
+                marker=dict(size=5, color="#60a5fa"),
+            ))
+    fig.add_hline(y=100, line_dash="dash", line_color="rgba(107,114,128,0.35)")
+    fig.update_layout(
+        template=_DARK, height=190,
+        margin=dict(l=0, r=0, t=6, b=0),
+        yaxis=dict(title="Indexed (100 = start)", tickformat=".2f"),
+        xaxis=dict(showgrid=False),
+        legend=dict(orientation="h", y=1.2, x=0, font=dict(size=10)),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    # ── Compute metrics ───────────────────────────────────────────────────────
+    m = _perf_metrics(port, spy_raw, INITIAL_CAPITAL)
+    if not m.get("ok"):
+        st.caption("⚠️  Could not load SPY data — check internet connection.")
+        return
+
+    # ── Metric card helpers ───────────────────────────────────────────────────
+    def _fv(key, fmt=".2f", suffix=""):
+        """Format a metric value; return 'N/A' for NaN."""
+        v = m.get(key, float("nan"))
+        return "N/A" if pd.isna(v) else f"{v:{fmt}}{suffix}"
+
+    def _card(label, port_key, spy_key=None, spy_fixed=None,
+              fmt=".2f", suffix="", higher_better=True):
+        """
+        Build a metric comparison card.
+        spy_fixed  – use a hardcoded comparison value instead of a dict key.
+        """
+        pv = m.get(port_key, float("nan"))
+        sv = (m.get(spy_key, float("nan")) if spy_key
+              else (spy_fixed if spy_fixed is not None else float("nan")))
+
+        ps = "N/A" if pd.isna(pv) else f"{pv:{fmt}}{suffix}"
+        ss = ("N/A" if pd.isna(sv)
+              else (f"{sv:{fmt}}{suffix}" if spy_key or spy_fixed is not None else "—"))
+
+        if not pd.isna(pv) and not pd.isna(sv):
+            win   = pv > sv if higher_better else pv < sv
+            color = "#10b981" if win else "#ef4444"
+            arrow = "▲" if win else "▼"
+        else:
+            color = "#f59e0b" if not pd.isna(pv) else "#6b7280"
+            arrow = ""
+
+        return (
+            f"<div style='background:rgba(255,255,255,0.03);"
+            f"border:1px solid rgba(245,158,11,0.15);border-radius:8px;"
+            f"padding:10px 12px;min-height:76px;'>"
+            f"<div style='font-size:0.55rem;color:#6b7280;text-transform:uppercase;"
+            f"letter-spacing:0.1em;margin-bottom:4px;'>{label}</div>"
+            f"<div style='font-size:1.05rem;font-weight:900;color:{color};"
+            f"font-family:monospace;line-height:1.2;'>"
+            f"{ps} <span style='font-size:0.7rem;'>{arrow}</span></div>"
+            f"<div style='font-size:0.65rem;color:#6b7280;margin-top:3px;'>"
+            f"SPY&nbsp;<span style='color:#60a5fa;'>{ss}</span></div>"
+            f"</div>"
+        )
+
+    # ── Row 1: Returns & efficiency ratios ────────────────────────────────────
+    r1 = st.columns(4)
+    r1[0].markdown(_card("Total Return",   "port_total", "spy_total",
+                          fmt="+.2f", suffix="%"), unsafe_allow_html=True)
+    r1[1].markdown(_card("Ann. Return",    "port_ann",   "spy_ann",
+                          fmt="+.2f", suffix="%"), unsafe_allow_html=True)
+    r1[2].markdown(_card("Sharpe Ratio",   "sharpe",     "spy_sharpe",
+                          fmt=".2f"),               unsafe_allow_html=True)
+    r1[3].markdown(_card("Sortino Ratio",  "sortino",    None,
+                          fmt=".2f"),               unsafe_allow_html=True)
+
+    # ── Row 2: Risk metrics ───────────────────────────────────────────────────
+    r2 = st.columns(4)
+    r2[0].markdown(_card("Beta",            "beta",    spy_fixed=1.0,
+                          fmt=".2f",  higher_better=False),       unsafe_allow_html=True)
+    r2[1].markdown(_card("Alpha (Jensen)", "alpha",   None,
+                          fmt="+.2f", suffix="%"),                unsafe_allow_html=True)
+    r2[2].markdown(_card("Max Drawdown",   "max_dd",  "spy_max_dd",
+                          fmt=".2f",  suffix="%", higher_better=True), unsafe_allow_html=True)
+    r2[3].markdown(_card("Ann. Volatility","port_vol","spy_vol",
+                          fmt=".2f",  suffix="%", higher_better=False), unsafe_allow_html=True)
+
+    # ── Footer: secondary metrics ─────────────────────────────────────────────
+    st.markdown(
+        f"<div style='display:flex;gap:20px;margin-top:6px;font-size:0.7rem;"
+        f"color:#9ca3af;flex-wrap:wrap;align-items:center;'>"
+        f"<span>📈 Treynor: <b style='color:#f1f5f9;'>{_fv('treynor','.3f')}</b></span>"
+        f"<span>⚖️ Info Ratio: <b style='color:#f1f5f9;'>{_fv('info_ratio','.2f')}</b></span>"
+        f"<span>🏆 Win Rate: <b style='color:#f1f5f9;'>{_fv('win_rate','.1f','%')}</b></span>"
+        f"<span>📉 Calmar: <b style='color:#f1f5f9;'>{_fv('calmar','.2f')}</b></span>"
+        f"<span style='margin-left:auto;font-size:0.58rem;color:#4b5563;'>"
+        f"n = {m['n']} return day(s)  ·  rf = 5% annual</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Tab renders
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def render_trading_floor(daily_results: list[dict], strategy_lbl: str, portfolio_report: dict | None):
+def render_daily_summary(daily_results: list[dict], strategy_lbl: str, portfolio_report: dict | None):
+    """Daily Summary tab — today's P/L header, AI summary and strategy agent side-by-side."""
+
     # ── Day 0: no simulation started — show welcome card only ────────────────
     if not daily_results:
         st.markdown(
@@ -250,110 +705,101 @@ def render_trading_floor(daily_results: list[dict], strategy_lbl: str, portfolio
         )
         return
 
-    # ── Daily Briefing (shown after at least one day has run) ────────────────
-    if portfolio_report:
-        r = portfolio_report
-        with st.container():
-            st.markdown(
-                f"<div style='font-size:0.65rem; font-weight:800; text-transform:uppercase; "
-                f"letter-spacing:0.14em; color:#f59e0b;'>📋 Daily Briefing  ·  {r['generated_date']}</div>",
-                unsafe_allow_html=True,
-            )
+    day      = daily_results[-1]
+    snap     = day["portfolio"]
+    init_cap = st.session_state["sim_capital"]
 
-            b1, b2, b3, b4 = st.columns(4)
-            b1.metric("Portfolio Value",  f"${r['portfolio_value']:,.0f}")
-            b2.metric("All-Time P/L",
-                      f"{r['alltime_pnl_pct']:+.2f}%",
-                      delta=f"${r['alltime_pnl']:+,.0f}")
-            b3.metric("5-Day P/L",
-                      f"{r['fiveday_pnl_pct']:+.2f}%",
-                      delta=f"${r['fiveday_pnl']:+,.0f}")
-            b4.metric("Win Rate",  f"{r['win_rate']:.0f}%",
-                      help="% of trading days portfolio increased")
-
-            with st.expander("📰 AI Market Summary", expanded=True):
-                st.markdown(
-                    f"<div style='line-height:1.7; color:#d1d5db; font-size:0.9rem;'>"
-                    f"{r['summary'].replace(chr(10), '<br>')}</div>",
-                    unsafe_allow_html=True,
-                )
-
-                # News headlines
-                if r.get("news_headlines"):
-                    st.divider()
-                    st.markdown(
-                        "<div style='font-size:0.65rem; font-weight:800; text-transform:uppercase; "
-                        "letter-spacing:0.12em; color:#f59e0b;'>Recent Headlines</div>",
-                        unsafe_allow_html=True,
-                    )
-                    for ticker, headlines in r["news_headlines"].items():
-                        for h in headlines:
-                            st.markdown(
-                                f"<div style='font-size:0.8rem; color:#9ca3af; "
-                                f"padding:2px 0;'>▸ <strong style='color:#d1d5db;'>"
-                                f"{ticker}</strong> — {h}</div>",
-                                unsafe_allow_html=True,
-                            )
-
-        st.divider()
-
-    day = daily_results[-1]
+    # ── Header: 4 KPI metrics ─────────────────────────────────────────────────
+    prev_val      = daily_results[-2]["portfolio"]["total_value"] if len(daily_results) > 1 else init_cap
+    today_pnl     = snap["total_value"] - prev_val
+    today_pnl_pct = (today_pnl / prev_val * 100) if prev_val > 0 else 0.0
 
     st.markdown(
-        f"<div style='font-size:0.72rem; font-weight:800; text-transform:uppercase; "
-        f"letter-spacing:0.12em; color:#f59e0b; margin-bottom:0.5rem;'>"
-        f"Day {day['day_num']}  ·  {day['date']}</div>",
+        f"<div style='font-size:0.65rem; font-weight:800; text-transform:uppercase; "
+        f"letter-spacing:0.14em; color:#f59e0b; margin-bottom:0.6rem;'>"
+        f"📅 Day {day['day_num']}  ·  {day['date']}</div>",
         unsafe_allow_html=True,
     )
 
-    left, right = st.columns([3, 2])
+    # ── Header KPI row (inline deltas via custom HTML) ────────────────────────
+    h1, h2, h3, h4 = st.columns(4)
 
-    # ── DataAgent output ──────────────────────────────────────────────────────
-    with left:
-        st.markdown("**Intelligence Report** *(Data Agent)*")
-        rows = []
-        for t, m in day["analysis"].items():
-            rows.append({
-                "Ticker":   t,
-                "Price":    f"${m['price']:.2f}",
-                "Mom 20d":  f"{m['momentum_20d']:+.2f}%",
-                "Mom 5d":   f"{m['momentum_5d']:+.2f}%",
-                "Z-Score":  f"{m['zscore']:+.3f}",
-                "RSI":      f"{m['rsi']:.1f}",
-                "vs SMA20": "▲" if m["above_sma20"] else "▼",
-            })
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True, height=280)
+    with h1:
+        st.markdown(_html_metric("Portfolio Value", f"${snap['total_value']:,.0f}"),
+                    unsafe_allow_html=True)
+    with h2:
+        st.markdown(_html_metric("Positions Value", f"${snap['positions_value']:,.0f}"),
+                    unsafe_allow_html=True)
+    with h3:
+        st.markdown(_html_metric("Cash", f"${snap['cash']:,.0f}"),
+                    unsafe_allow_html=True)
+    with h4:
+        _pos = True if today_pnl > 0 else (False if today_pnl < 0 else None)
+        st.markdown(
+            _html_metric("Today's Return", f"{today_pnl_pct:+.2f}%",
+                         delta=f"${today_pnl:+,.0f}", delta_positive=_pos),
+            unsafe_allow_html=True,
+        )
 
-    # ── Strategy + Risk + Execution output ───────────────────────────────────
-    with right:
-        st.markdown("**Strategy Agent's Play**")
+    st.divider()
 
-        approved_keys = {(t["ticker"], t["action"]) for t in day["approved_trades"]}
+    # ── Two-column: AI Market Summary | Strategy Agent's Play ─────────────────
+    col_summary, col_strategy = st.columns(2, gap="medium")
 
-        if not day["proposed_trades"]:
-            st.info("No trades proposed today.")
-        else:
-            for prop in day["proposed_trades"]:
-                key     = (prop["ticker"], prop["action"])
-                is_buy  = prop["action"] == "BUY"
-                icon    = "🟢" if is_buy else "🔴"
-                verdict = "✅ executed" if key in approved_keys else "❌ blocked"
-                color   = "#10b981" if is_buy else "#ef4444"
+    _HDR = (
+        "font-size:0.62rem; font-weight:800; text-transform:uppercase; "
+        "letter-spacing:0.14em; color:#f59e0b; margin-bottom:0.8rem;"
+    )
+
+    with col_summary:
+        with st.container(border=True):
+            st.markdown(f"<div style='{_HDR}'>📰 AI Market Summary</div>",
+                        unsafe_allow_html=True)
+            if portfolio_report and portfolio_report.get("summary"):
+                st.markdown(portfolio_report["summary"])
+            else:
+                st.caption("No AI summary yet — run a simulation day to generate one.")
+
+    with col_strategy:
+        with st.container(border=True):
+            st.markdown(f"<div style='{_HDR}'>🤖 Strategy Agent's Play</div>",
+                        unsafe_allow_html=True)
+
+            approved_keys = {(t["ticker"], t["action"]) for t in day["approved_trades"]}
+
+            if not day["proposed_trades"]:
+                st.info("No trades proposed today.")
+            else:
+                rows_html = ""
+                for prop in day["proposed_trades"]:
+                    key       = (prop["ticker"], prop["action"])
+                    is_buy    = prop["action"] == "BUY"
+                    icon      = "🟢" if is_buy else "🔴"
+                    verdict   = "✅ executed" if key in approved_keys else "❌ blocked"
+                    color     = "#10b981" if is_buy else "#ef4444"
+                    reasoning = prop.get("reasoning", "")
+                    rows_html += (
+                        f"<div style='padding:0.5rem 0; border-bottom:1px solid rgba(255,255,255,0.05);'>"
+                        f"{icon} <span style='color:{color}; font-weight:700;'>"
+                        f"{prop['action']} {prop['ticker']}</span>"
+                        f"&nbsp;&nbsp;<span style='color:#9ca3af; font-size:0.8rem;'>{verdict}</span>"
+                        f"<div style='font-size:0.72rem; color:#6b7280; margin-top:2px;'>{reasoning}</div>"
+                        f"</div>"
+                    )
+                st.markdown(rows_html, unsafe_allow_html=True)
+
+            if day["violations"]:
                 st.markdown(
-                    f"{icon} <span style='color:{color}; font-weight:700;'>"
-                    f"{prop['action']} {prop['ticker']}</span> &nbsp; {verdict}",
+                    "<div style='margin-top:0.8rem; font-size:0.72rem; font-weight:700; "
+                    "color:#f59e0b;'>⚠️ Risk Agent — Blocked Plays</div>",
                     unsafe_allow_html=True,
                 )
-                st.caption(prop.get("reasoning", ""))
+                for v in day["violations"]:
+                    st.warning(v, icon="⚠️")
 
-        if day["violations"]:
-            st.markdown("**Risk Agent — Blocked Plays**")
-            for v in day["violations"]:
-                st.warning(v, icon="⚠️")
-
-        if day.get("llm_reasoning"):
-            with st.expander("Raw LLM output"):
-                st.code(day["llm_reasoning"], language="json")
+            if day.get("llm_reasoning"):
+                with st.expander("Raw LLM output"):
+                    st.code(day["llm_reasoning"], language="json")
 
     st.divider()
 
@@ -379,29 +825,82 @@ def render_trading_floor(daily_results: list[dict], strategy_lbl: str, portfolio
                     st.caption("No trades executed.")
 
 
-def render_portfolio(db: PortfolioDatabase, daily_results: list[dict]):
+def render_portfolio(
+    db:               "PortfolioDatabase",
+    daily_results:    list[dict],
+    initial_capital:  float,
+    portfolio_report: dict | None,
+):
     if not daily_results:
         st.info("Start a simulation to see your portfolio.")
         return
 
-    latest  = daily_results[-1]
-    snap    = latest["portfolio"]
-    prices  = {t: m["price"] for t, m in latest["analysis"].items()}
+    latest = daily_results[-1]
+    snap   = latest["portfolio"]
+
+    # ── Portfolio header KPIs (inline deltas via custom HTML) ────────────────
+    if portfolio_report:
+        r = portfolio_report
+        h1, h2, h3, h4 = st.columns(4)
+
+        with h1:
+            st.markdown(_html_metric("Portfolio Value", f"${r['portfolio_value']:,.0f}"),
+                        unsafe_allow_html=True)
+        with h2:
+            _pos2 = True if r['fiveday_pnl'] > 0 else (False if r['fiveday_pnl'] < 0 else None)
+            st.markdown(
+                _html_metric("5-Day P/L", f"{r['fiveday_pnl_pct']:+.2f}%",
+                             delta=f"${r['fiveday_pnl']:+,.0f}", delta_positive=_pos2),
+                unsafe_allow_html=True,
+            )
+        with h3:
+            _pos3 = True if r['alltime_pnl'] > 0 else (False if r['alltime_pnl'] < 0 else None)
+            st.markdown(
+                _html_metric("All-Time P/L", f"{r['alltime_pnl_pct']:+.2f}%",
+                             delta=f"${r['alltime_pnl']:+,.0f}", delta_positive=_pos3),
+                unsafe_allow_html=True,
+            )
+        with h4:
+            st.markdown(_html_metric("Win Rate", f"{r['win_rate']:.0f}%"),
+                        unsafe_allow_html=True)
+    else:
+        st.markdown(_html_metric("Portfolio Value", f"${snap['total_value']:,.0f}"),
+                    unsafe_allow_html=True)
+
+    st.divider()
+
+    # ── USD Portfolio Value graph (equity curve) ──────────────────────────────
+    history_df = db.get_portfolio_history()
+    if not history_df.empty:
+        st.plotly_chart(
+            chart_equity_curve(history_df, initial_capital),
+            use_container_width=True,
+        )
+        st.divider()
+
+    # ── Portfolio vs S&P 500 ──────────────────────────────────────────────────
+    if len(daily_results) >= 1:
+        _render_vs_sp500(daily_results)
+        st.divider()
 
     # ── Holdings ─────────────────────────────────────────────────────────────
     st.markdown("**Holdings**")
     if snap["positions"]:
         rows = []
         for t, p in snap["positions"].items():
-            pnl_val = p["value"] - p["shares"] * p["average_cost"]
+            # Use prices rounded to 2 dp so P/L is consistent with what is displayed
+            avg_r = round(p["average_cost"],  2)
+            cur_r = round(p["current_price"], 2)
+            pnl_val = round(p["shares"] * (cur_r - avg_r), 2)
+            pnl_pct = round((cur_r / avg_r - 1.0) * 100.0, 2) if avg_r > 0 else 0.0
             rows.append({
                 "Ticker":    t,
                 "Qty":       round(p["shares"], 4),
-                "Avg Cost":  f"${p['average_cost']:.2f}",
-                "Last Px":   f"${p['current_price']:.2f}",
+                "Avg Cost":  f"${avg_r:,.2f}",
+                "Last Px":   f"${cur_r:,.2f}",
                 "Mkt Value": f"${p['value']:,.2f}",
                 "P/L $":     f"${pnl_val:+,.2f}",
-                "P/L %":     f"{p['pnl_pct']:+.2f}%",
+                "P/L %":     f"{pnl_pct:+.2f}%",
             })
         df_pos = pd.DataFrame(rows)
 
@@ -571,6 +1070,45 @@ def render_portfolio(db: PortfolioDatabase, daily_results: list[dict]):
             hide_index=True, use_container_width=True, height=300,
         )
 
+    st.divider()
+
+    # ── Daily Snapshots ───────────────────────────────────────────────────────
+    st.markdown("**Daily Snapshots**")
+    snap_rows = []
+    for i, d in enumerate(daily_results):
+        d_snap  = d["portfolio"]
+        prev_eq = daily_results[i-1]["portfolio"]["total_value"] if i > 0 else initial_capital
+        day_pnl = d_snap["total_value"] - prev_eq
+        snap_rows.append({
+            "Date":     d["date"],
+            "Cash":     f"${d_snap['cash']:,.2f}",
+            "Holdings": f"${d_snap['positions_value']:,.2f}",
+            "Total":    f"${d_snap['total_value']:,.2f}",
+            "Day P/L":  f"${day_pnl:+,.2f}",
+            "Trades":   len(d["approved_trades"]),
+            "Notes":    ", ".join(
+                            f"{t['action']} {t['ticker']}"
+                            for t in d["approved_trades"]
+                        ) or "—",
+        })
+
+    if snap_rows:
+        def _color_snap_pnl(val):
+            if not isinstance(val, str):
+                return ""
+            if val.startswith("+") or (len(val) > 1 and val[1] == "+"):
+                return "color:#10b981; font-weight:700"
+            if val.startswith("-") or (len(val) > 1 and val[1] == "-"):
+                return "color:#ef4444; font-weight:700"
+            return ""
+
+        st.dataframe(
+            pd.DataFrame(snap_rows).style.map(_color_snap_pnl, subset=["Day P/L"]),
+            hide_index=True, use_container_width=True,
+        )
+    else:
+        st.info("Run at least one day to see the snapshot table.")
+
 
 def render_performance(db: PortfolioDatabase, initial_capital: float, daily_results: list[dict]):
     history_df = db.get_portfolio_history()
@@ -662,30 +1200,21 @@ def render_market_data(db: PortfolioDatabase):
     st.caption("Fetches all S&P 500 constituents with latest OHLCV via yfinance. Cached in local DB.")
 
     fetch_dates = db.get_sp500_fetch_dates()
-    col_btn, col_date = st.columns([1, 3])
 
-    with col_btn:
-        fetch_btn = st.button("Fetch / Refresh", type="primary", use_container_width=True)
-
-    if fetch_btn:
-        with st.spinner("Pulling quotes from Yahoo Finance …"):
-            try:
-                md.fetch_and_store_sp500(db)
-                st.success("Market data refreshed.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Failed: {exc}")
-                return
-
-    fetch_dates = db.get_sp500_fetch_dates()
     if not fetch_dates:
-        st.info("No data yet — press **Fetch / Refresh** to download today's quotes.")
+        st.info("No data yet — press **Fetch / Refresh** below to download today's quotes.")
+        if st.button("🔄  Fetch / Refresh", type="primary", use_container_width=True):
+            with st.spinner("Pulling quotes from Yahoo Finance …"):
+                try:
+                    md.fetch_and_store_sp500(db)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Failed: {exc}")
         return
 
-    with col_date:
-        selected_date = st.selectbox(
-            "Snapshot", options=fetch_dates, index=0, label_visibility="collapsed"
-        )
+    selected_date = st.selectbox(
+        "Snapshot", options=fetch_dates, index=0, label_visibility="collapsed"
+    )
 
     df = db.get_sp500_stocks(selected_date)
     if df.empty:
@@ -705,12 +1234,16 @@ def render_market_data(db: PortfolioDatabase):
         if not _pd_vals.empty:
             price_date = str(_pd_vals.iloc[0])
 
+    # ── Summary metrics (no delta badges) ─────────────────────────────────────
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Stocks",       str(total))
-    m2.metric("Winners",      str(gainers), delta=f"+{gainers}")
-    m3.metric("Losers",       str(losers),  delta=f"-{losers}", delta_color="inverse")
-    m4.metric("Market Date",  price_date,
-              help=f"Actual trading date of the OHLCV data · Fetched: {selected_date}")
+    with m1:
+        st.markdown(_html_metric("Stocks",      str(total)),   unsafe_allow_html=True)
+    with m2:
+        st.markdown(_html_metric("Winners",     str(gainers)), unsafe_allow_html=True)
+    with m3:
+        st.markdown(_html_metric("Losers",      str(losers)),  unsafe_allow_html=True)
+    with m4:
+        st.markdown(_html_metric("Market Date", price_date),   unsafe_allow_html=True)
 
     if price_date != selected_date:
         st.caption(
@@ -720,6 +1253,7 @@ def render_market_data(db: PortfolioDatabase):
 
     st.divider()
 
+    # ── Filters ───────────────────────────────────────────────────────────────
     fc1, fc2, fc3 = st.columns([2, 1, 1])
     with fc1:
         search = st.text_input("Search ticker or company", placeholder="e.g. AAPL or Apple")
@@ -768,6 +1302,17 @@ def render_market_data(db: PortfolioDatabase):
         }),
         hide_index=True, use_container_width=True, height=600,
     )
+
+    st.divider()
+
+    # ── Fetch / Refresh button at the bottom ──────────────────────────────────
+    if st.button("🔄  Fetch / Refresh Market Data", type="primary", use_container_width=True):
+        with st.spinner("Pulling quotes from Yahoo Finance …"):
+            try:
+                md.fetch_and_store_sp500(db)
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Failed: {exc}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -902,17 +1447,111 @@ def render_roulette():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Deal-next-hand logic (shared by button click and auto-deal after Start Game)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _deal_next_hand(db: "PortfolioDatabase") -> None:
+    """
+    Run the full proposal pipeline for the next simulation day and store the
+    result in st.session_state["pending_day_data"]. Finishes with st.rerun()
+    so the trade-confirmation dialog fires on the next pass.
+    """
+    day_num      = st.session_state["sim_day_num"]
+    strategy_now = st.session_state["sim_strategy"]
+
+    # 1. Pull in the latest market close prices
+    with st.spinner("Fetching latest market data …"):
+        try:
+            md.refresh_latest_day(CSV_PATH)
+            st.cache_data.clear()
+        except Exception as exc:
+            st.warning(f"Could not refresh market data: {exc}")
+
+    prices_df_fresh = load_price_data()
+    sim_date        = prices_df_fresh.index.max()
+    date_str        = sim_date.strftime("%Y-%m-%d")
+    prices          = prices_df_fresh.loc[sim_date].to_dict()
+    portfolio       = db.get_portfolio_state(prices)
+
+    # 2. Run analysis + strategy (proposal phase only — execution waits for
+    #    user confirmation in the dialog)
+    _spinner_msg = (
+        f"Asking Claude to propose Day {day_num} trades …"
+        if API_KEY
+        else f"Analysing Day {day_num} (deterministic mode) …"
+    )
+    with st.spinner(_spinner_msg):
+        data_agent     = DataAgent()
+        strategy_agent = StrategyAgent(strategy_now)
+        analysis       = data_agent.analyze(prices_df_fresh, sim_date)
+        proposed       = strategy_agent.propose_trades(
+            analysis, portfolio, date_str, day_num
+        )
+
+    # 3. Store payload; the dialog fires on the next rerun
+    st.session_state["pending_day_data"] = {
+        "proposals":  proposed,
+        "analysis":   analysis,
+        "sim_date":   sim_date,
+        "prices":     prices,
+        "strategy":   strategy_now,
+        "reasoning":  strategy_agent.reasoning,
+        "day_num":    day_num,
+        "portfolio":  portfolio,
+        "api_failed": strategy_agent.api_failed,
+        "api_error":  strategy_agent.api_error,
+    }
+    st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Session restore helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _restore_session_from_db(db: PortfolioDatabase) -> None:
+    """
+    On the first Streamlit page load of a new browser session, restore
+    simulation state from SQLite so the user does not lose progress after a
+    page refresh or server restart.
+
+    Only runs once per session (guard: checks for 'sim_started' in session
+    state which is always set by the defaults loop that follows this call).
+    """
+    if "sim_started" in st.session_state:
+        return  # already initialised this session — nothing to do
+
+    if not db.has_simulation():
+        return  # DB was never seeded — let the user click Start New Game
+
+    results = db.load_all_day_results()
+
+    # Mark the simulation as active regardless of whether any days are done
+    st.session_state["sim_started"]      = True
+    st.session_state["daily_results"]    = results
+    st.session_state["sim_date_idx"]     = len(results)
+    st.session_state["sim_day_num"]      = len(results) + 1
+    st.session_state["sim_dates"]        = []          # rebuilt on each Next Hand
+    st.session_state["sim_capital"]      = INITIAL_CAPITAL
+    st.session_state["sim_strategy"]     = "Momentum"
+    st.session_state["pending_day_data"] = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     db = PortfolioDatabase()
 
+    # ── Restore simulation state from DB on fresh page load ──────────────────
+    # Must run BEFORE the defaults loop so restored keys are not overwritten.
+    _restore_session_from_db(db)
+
     # Load price data only if the CSV exists (created by Start New Game)
     _csv_ready = Path(CSV_PATH).exists()
     prices_df  = load_price_data() if _csv_ready else None
 
-    # ── Session state init ────────────────────────────────────────────────────
+    # ── Session state init (only sets keys not yet present) ──────────────────
     defaults = {
         "sim_started":       False,
         "sim_date_idx":      0,
@@ -923,6 +1562,7 @@ def main():
         "sim_strategy":      "Momentum",
         "portfolio_report":  None,
         "report_date":       "",
+        "pending_day_data":  None,   # set when waiting for trade confirmation
         # roulette
         "roulette_wins":     0,
         "roulette_losses":   0,
@@ -933,9 +1573,14 @@ def main():
         if k not in st.session_state:
             st.session_state[k] = v
 
+    today_str = date.today().isoformat()
+
+    # ── Show trade confirmation dialog if a proposal is pending ──────────────
+    if st.session_state.get("pending_day_data") is not None:
+        show_proposals_dialog(db, today_str)
+
     # ── Auto-generate portfolio report once per calendar day ─────────────────
     # Only runs after Start New Game has populated the price CSV
-    today_str = date.today().isoformat()
     if _csv_ready and st.session_state["report_date"] != today_str:
         with st.spinner("Generating daily briefing …"):
             try:
@@ -948,68 +1593,73 @@ def main():
                 st.session_state["portfolio_report"] = None
                 logger.warning("Portfolio report failed: %s", exc)
 
-    # ── Sidebar ───────────────────────────────────────────────────────────────
-    with st.sidebar:
+    # ── Compute advance flags (needed for control strip + auto-deal) ─────────
+    already_ran_today = db.get_last_advance_date() == today_str
+    dates_remaining   = (
+        st.session_state["sim_started"]
+        and st.session_state["sim_date_idx"] < SIMULATION_DAYS
+    )
+    pending_confirm = st.session_state.get("pending_day_data") is not None
+    can_advance = (
+        dates_remaining
+        and not already_ran_today
+        and not pending_confirm
+        and prices_df is not None
+    )
+
+    # Auto-deal: fires once on the rerun immediately after Start New Game
+    if st.session_state.pop("auto_deal", False) and can_advance:
+        _deal_next_hand(db)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ── Title
+    # ─────────────────────────────────────────────────────────────────────────
+    st.markdown(
+        "<h1 style='font-size:2.1rem; font-weight:900; color:#f1f5f9; "
+        "text-transform:uppercase; letter-spacing:0.04em; margin-top:0.4rem; "
+        "margin-bottom:0; text-align:center;'>"
+        "AI Investment Application"
+        "<span style='color:#f59e0b;'> · Paper Trading Simulator</span></h1>",
+        unsafe_allow_html=True,
+    )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ── Persistent control strip (always visible, cannot be hidden)
+    # ─────────────────────────────────────────────────────────────────────────
+    st.markdown('<div class="ctrl-top-border"></div>', unsafe_allow_html=True)
+
+    _today     = date.today()
+    _date_part = f"{_ordinal(_today.day)} {_today.strftime('%B %Y')}"
+    if st.session_state["sim_started"] and st.session_state["daily_results"]:
+        _day_label = f"DAY&nbsp;{st.session_state['sim_day_num'] - 1}"
+    else:
+        _day_label = "DAY&nbsp;—"
+
+    c_date, c_start, c_deal, c_rou, c_api = st.columns([2, 2, 2, 1, 2])
+
+    with c_date:
         st.markdown(
-            "<div style='font-size:1.3rem; font-weight:900; color:#f59e0b; "
-            "text-transform:uppercase; letter-spacing:0.1em; margin-bottom:0.25rem;'>"
-            "🎰 The Trading Floor</div>",
+            f"<div style='padding:0.35rem 0; line-height:1.4;'>"
+            f"<div style='font-family:monospace; font-size:0.95rem; font-weight:900; "
+            f"color:#f59e0b; letter-spacing:0.02em;'>{_date_part}</div>"
+            f"<div style='font-size:0.68rem; font-weight:800; color:#6b7280; "
+            f"text-transform:uppercase; letter-spacing:0.14em;'>{_day_label}</div>"
+            f"</div>",
             unsafe_allow_html=True,
         )
-        st.caption("AI-powered paper trading simulator")
-        st.divider()
 
-        # Current date display — "5th March 2026  |  Day: 1"
-        _today     = date.today()
-        _date_part = f"{_ordinal(_today.day)} {_today.strftime('%B %Y')}"
-
-        if st.session_state["sim_started"] and st.session_state["daily_results"]:
-            day_num = st.session_state["sim_day_num"] - 1
-            st.markdown(
-                f"<div style='font-size:1.05rem; font-weight:900; font-family:monospace; "
-                f"color:#f59e0b; line-height:1.3;'>"
-                f"{_date_part}"
-                f"<span style='color:#6b7280; font-weight:400;'>&nbsp; | &nbsp;</span>"
-                f"Day: {day_num}"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                f"<div style='font-size:1.05rem; font-weight:900; font-family:monospace; "
-                f"color:#f59e0b; line-height:1.3;'>"
-                f"{_date_part}"
-                f"<span style='color:#6b7280; font-weight:400;'>&nbsp; | &nbsp;</span>"
-                f"Day: —"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-
-        st.divider()
-
-        # ── Roulette mini-game ─────────────────────────────────────────────
-        render_roulette()
-
-        st.divider()
-
-        # ── Simulation controls ────────────────────────────────────────────
-        # ── Start New Game button ──────────────────────────────────────────
+    with c_start:
         if st.button("🎲  Start New Game", type="primary", use_container_width=True):
-            with st.spinner("Wiping data and fetching fresh S&P 500 data from Yahoo Finance …"):
+            with st.spinner("Fetching fresh S&P 500 data …"):
                 try:
-                    # 1. Full DB wipe (all tables)
                     db.reset_all(INITIAL_CAPITAL)
-                    # 2. Pull real S&P 500 price history and overwrite the CSV
                     fresh_df = md.fetch_sp500_prices_csv(CSV_PATH)
-                    # 3. Fetch today's OHLCV snapshot into the sp500_stocks table
                     md.fetch_and_store_sp500(db)
-                    # 4. Bust the cache so the new CSV is picked up on rerun
                     st.cache_data.clear()
                 except Exception as exc:
                     st.error(f"Failed to fetch market data: {exc}")
                     st.stop()
 
-            # Pick the last SIMULATION_DAYS trading days from the fresh data
             fresh_df.index = pd.to_datetime(fresh_df.index)
             fresh_df = fresh_df.sort_index()
             sim_dates = fresh_df.index[-SIMULATION_DAYS:].tolist()
@@ -1024,86 +1674,47 @@ def main():
                 "sim_strategy":     "Momentum",
                 "report_date":      "",
                 "portfolio_report": None,
+                "pending_day_data": None,
+                "auto_deal":        True,
             })
             st.rerun()
 
-        # ── Deal Next Hand button ──────────────────────────────────────────
-        already_ran_today = db.get_last_advance_date() == today_str
-        dates_remaining   = (
-            st.session_state["sim_started"]
-            and st.session_state["sim_date_idx"] < len(st.session_state["sim_dates"])
-        )
-        # prices_df is always available when sim_started (Start New Game fetches it first)
-        can_advance = dates_remaining and not already_ran_today and prices_df is not None
-
-        if already_ran_today and dates_remaining:
-            st.markdown(
-                "<div style='font-size:0.72rem; color:#f59e0b; font-weight:700; "
-                "text-align:center; padding:0.5rem 0;'>"
-                "⏳ Already ran today — come back tomorrow</div>",
-                unsafe_allow_html=True,
-            )
-
-        if st.button(
-            "📈  Deal Next Hand",
-            disabled=not can_advance,
-            use_container_width=True,
-        ):
-            idx          = st.session_state["sim_date_idx"]
-            sim_date     = st.session_state["sim_dates"][idx]
-            strategy_now = st.session_state["sim_strategy"]
-
-            with st.spinner(f"Running Day {st.session_state['sim_day_num']} …"):
-                result = run_single_day(prices_df, sim_date, strategy_now, db)
-
-            db.set_last_advance_date(today_str)
-            st.session_state["daily_results"].append(result)
-            st.session_state["sim_date_idx"] += 1
-            st.session_state["sim_day_num"]  += 1
-            # Regenerate report after advancing
-            st.session_state["report_date"] = ""
-            st.rerun()
-
+    with c_deal:
         if st.session_state["sim_started"] and not dates_remaining:
-            st.success("Simulation complete — all hands dealt.", icon="🏁")
-
-        st.divider()
-        if API_KEY:
-            st.success("Claude API: connected", icon="🤖")
+            st.success("All hands dealt", icon="🏁")
         else:
-            st.warning("No API key — rule-based mode", icon="⚙️")
+            if already_ran_today and dates_remaining:
+                st.markdown(
+                    "<div style='font-size:0.65rem; color:#f59e0b; font-weight:700; "
+                    "text-align:center; padding:0.15rem 0 0.1rem;'>"
+                    "⏳ Come back tomorrow</div>",
+                    unsafe_allow_html=True,
+                )
+            if st.button(
+                "📈  Deal Next Hand",
+                disabled=not can_advance,
+                use_container_width=True,
+            ):
+                _deal_next_hand(db)
 
-    # ── Top KPI bar ───────────────────────────────────────────────────────────
-    st.markdown(
-        "<h1 style='font-size:1.6rem; font-weight:900; color:#f1f5f9; "
-        "text-transform:uppercase; letter-spacing:0.05em; margin-bottom:0;'>"
-        "AI Investment Application"
-        "<span style='color:#f59e0b;'> · Paper Trading Simulator</span></h1>",
-        unsafe_allow_html=True,
-    )
+    with c_rou:
+        with st.popover("🎰", use_container_width=True):
+            render_roulette()
 
-    # Live KPI bar
-    if st.session_state["daily_results"]:
-        snap     = st.session_state["daily_results"][-1]["portfolio"]
-        init_cap = st.session_state["sim_capital"]
-        pnl      = snap["total_value"] - init_cap
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Total Portfolio Value", f"${snap['total_value']:,.2f}", delta=f"${pnl:+,.2f}")
-        k2.metric("Bankroll (Cash)",       f"${snap['cash']:,.2f}")
-        k3.metric("Holdings Value",        f"${snap['positions_value']:,.2f}")
-        k4.metric("Open Positions",        str(len(snap["positions"])))
-    else:
-        k1, k2 = st.columns(2)
-        k1.metric("Total Portfolio Value", f"${st.session_state['sim_capital']:,.2f}")
-        k2.metric("Bankroll (Cash)",       f"${st.session_state['sim_capital']:,.2f}")
+    with c_api:
+        if API_KEY:
+            st.success("Claude AI · connected", icon="🤖")
+        else:
+            st.warning("Rule-based mode", icon="⚙️")
 
-    st.divider()
+    st.markdown('<div class="ctrl-bottom-border"></div>', unsafe_allow_html=True)
 
-    # ── Main tabs ─────────────────────────────────────────────────────────────
-    tab_floor, tab_portfolio, tab_performance, tab_market = st.tabs([
-        "🎰  Trading Floor",
+    # ─────────────────────────────────────────────────────────────────────────
+    # ── Main tabs
+    # ─────────────────────────────────────────────────────────────────────────
+    tab_summary, tab_portfolio, tab_market = st.tabs([
+        "🗓️  Daily Summary",
         "📊  Portfolio",
-        "📈  Performance",
         "🌐  Market Data",
     ])
 
@@ -1112,14 +1723,11 @@ def main():
     init_cap         = st.session_state["sim_capital"]
     portfolio_report = st.session_state.get("portfolio_report")
 
-    with tab_floor:
-        render_trading_floor(daily_results, strategy_lbl, portfolio_report)
+    with tab_summary:
+        render_daily_summary(daily_results, strategy_lbl, portfolio_report)
 
     with tab_portfolio:
-        render_portfolio(db, daily_results)
-
-    with tab_performance:
-        render_performance(db, init_cap, daily_results)
+        render_portfolio(db, daily_results, init_cap, portfolio_report)
 
     with tab_market:
         render_market_data(db)

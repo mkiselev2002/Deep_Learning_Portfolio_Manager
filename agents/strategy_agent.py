@@ -1,61 +1,71 @@
 """
 agents/strategy_agent.py
 ─────────────────────────
-StrategyAgent — selects trades based on configurable strategy rules.
+StrategyAgent — daily rebalance: liquidate → high-vol losers.
 
-Responsibilities
-────────────────
-  1. Receives the market analysis from DataAgent and the current portfolio state.
-  2. Applies the active strategy's entry/exit rules to identify trade candidates.
-  3. Returns a list of proposed trades for RiskAgent to validate.
+Strategy (executed every time "Next Day" is clicked)
+─────────────────────────────────────────────────────
+  1. SELL all currently held positions (full liquidation to cash).
+  2. From the S&P 500 universe, rank every ticker by 5-day realised
+     volatility (annualised std-dev of daily log returns).
+  3. Keep the top-50 highest-volatility tickers.
+  4. From that shortlist, pick the 3–5 with the largest percentage LOSS
+     on the previous trading day. Claude uses RSI and 20-day momentum
+     to decide exactly how many to buy (3 = high conviction, 5 = spread).
+  5. Buy equal amounts across the chosen picks
+     (e.g. 33 % each for 3, 25 % for 4, 20 % for 5).
 
-─────────────────────────────────────────────────────────────────────────────
-  STRATEGY RULES
-  ── Awaiting configuration from user ──
-  The `_rules_momentum` and `_rules_mean_reversion` methods below contain
-  placeholder logic.  Replace the body of each method with the actual rules
-  once they are provided.
-─────────────────────────────────────────────────────────────────────────────
+Primary execution path
+──────────────────────
+  Claude API (tool use) — receives a formatted table of the top-50
+  volatile stocks, reasons about the picks, then calls the
+  `submit_trade_proposals` tool with the final trade list.
+
+Fallback execution path
+───────────────────────
+  If the API key is absent or the LLM call raises any exception,
+  StrategyAgent falls back to the deterministic Python implementation
+  of the same rules and sets `self.api_failed = True`.
 
 Output format (each proposed trade)
 ────────────────────────────────────
   {
-      "ticker":           str,    # symbol
+      "ticker":           str,   # symbol
       "action":           "BUY" | "SELL",
-      "pct_of_portfolio": float,  # % of total portfolio value to trade (1–40)
-      "reasoning":        str,    # one-line explanation
+      "pct_of_portfolio": float, # % of total portfolio value to trade
+      "reasoning":        str,   # one-line explanation
   }
 """
 
-import json
 import logging
-import re
 
 import anthropic
 
-from config import API_KEY, MODEL, MAX_POSITION_PCT, MAX_TRADES_PER_DAY
+from config import API_KEY, MODEL
 
 logger = logging.getLogger(__name__)
-
-_JSON_BLOCK = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 
 class StrategyAgent:
     """
-    Selects trades via an LLM (Claude) with a rule-based fallback.
+    Volatility-reversion strategy agent.
 
-    Parameters
+    Attempts to use Claude (tool-use) to select and justify trades.
+    Falls back to the deterministic implementation if the API is
+    unavailable or raises an exception.
+
+    Attributes
     ----------
-    strategy : "Momentum" | "Mean Reversion"
+    api_failed : bool   – True when the LLM call failed this turn
+    api_error  : str    – human-readable error message (empty on success)
+    reasoning  : str    – one-line summary of what the agent decided
     """
 
     def __init__(self, strategy: str):
-        self.strategy  = strategy
-        self.use_llm   = bool(API_KEY)
-        self.reasoning = ""           # populated after each call
-
-        if self.use_llm:
-            self.client = anthropic.Anthropic(api_key=API_KEY)
+        self.strategy   = strategy
+        self.reasoning  = ""
+        self.api_failed = False
+        self.api_error  = ""
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -69,227 +79,274 @@ class StrategyAgent:
         """
         Returns a list of raw trade proposals (before risk validation).
 
-        Parameters
-        ----------
-        analysis     : output of DataAgent.analyze()
-        portfolio    : output of PortfolioDatabase.get_portfolio_state()
-        current_date : ISO date string "YYYY-MM-DD"
-        day_number   : 1-based index within the simulation week
+        Tries the Claude API first; falls back to deterministic logic on
+        any failure.
         """
-        if self.use_llm:
-            return self._llm_propose(analysis, portfolio, current_date, day_number)
-        return self._rule_propose(analysis, portfolio)
+        self.api_failed = False
+        self.api_error  = ""
 
-    # ── LLM branch ───────────────────────────────────────────────────────────
-
-    def _llm_propose(
-        self,
-        analysis:     dict[str, dict],
-        portfolio:    dict,
-        current_date: str,
-        day_number:   int,
-    ) -> list[dict]:
-        prompt = self._build_prompt(analysis, portfolio, current_date, day_number)
-        try:
-            response = self.client.messages.create(
-                model=MODEL,
-                max_tokens=512,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = response.content[0].text.strip()
-            self.reasoning = raw
-            return self._parse_json(raw)
-
-        except Exception as exc:
-            logger.warning("StrategyAgent LLM call failed (%s) — using rule-based fallback.", exc)
-            self.reasoning = f"[LLM error – fallback] {exc}"
-            return self._rule_propose(analysis, portfolio)
-
-    def _build_prompt(
-        self,
-        analysis:     dict[str, dict],
-        portfolio:    dict,
-        current_date: str,
-        day_number:   int,
-    ) -> str:
-        total  = portfolio["total_value"]
-        cash   = portfolio["cash"]
-        cash_p = cash / total * 100.0
-
-        pos_lines = []
-        for t, p in portfolio.get("positions", {}).items():
-            w   = p["value"] / total * 100.0
-            pnl = p["pnl_pct"]
-            pos_lines.append(f"  {t:6s}: {w:5.1f}%  (P&L {pnl:+.1f}%)")
-        pos_block = "\n".join(pos_lines) if pos_lines else "  (no positions – fully in cash)"
-
-        rows = []
-        for t, m in analysis.items():
-            rows.append(
-                f"  {t:6s}: ${m['price']:8.2f}  "
-                f"mom20={m['momentum_20d']:+6.2f}%  "
-                f"mom5={m['momentum_5d']:+5.2f}%  "
-                f"z={m['zscore']:+5.2f}  "
-                f"rsi={m['rsi']:5.1f}  "
-                f"{'above' if m['above_sma20'] else 'below'} SMA20"
-            )
-        analysis_block = "\n".join(rows)
-
-        # ─────────────────────────────────────────────────────────────────────
-        # STRATEGY GUIDANCE
-        # ── Replace these strings with the actual rule descriptions once
-        #    provided by the user.
-        # ─────────────────────────────────────────────────────────────────────
-        guidance = {
-            "Momentum": (
-                "BUY the 1-2 tickers with the strongest positive 20-day momentum AND rsi < 70. "
-                "SELL any held tickers whose 20-day momentum turned negative or rsi > 75."
-            ),
-            "Mean Reversion": (
-                "BUY 1-2 tickers with z-score < -1.0 (oversold) AND rsi < 45. "
-                "SELL held tickers with z-score > +1.0 (overbought) OR rsi > 65."
-            ),
-        }.get(self.strategy, "")
-
-        tickers_str = " ".join(analysis.keys())
-
-        return f"""You are a quantitative portfolio manager running a paper-trading simulation.
-
-DATE: {current_date}  (Day {day_number} of 5)
-STRATEGY: {self.strategy}
-TOTAL PORTFOLIO VALUE: ${total:,.2f}
-CASH AVAILABLE: ${cash:,.2f}  ({cash_p:.1f}%)
-
-CURRENT POSITIONS:
-{pos_block}
-
-MARKET ANALYSIS (data up to today):
-{analysis_block}
-
-STRATEGY GUIDANCE:
-{guidance}
-
-HARD CONSTRAINTS (enforced by the Risk Agent downstream):
-• Max position size: {MAX_POSITION_PCT*100:.0f}% of total portfolio
-• Max {MAX_TRADES_PER_DAY} proposals executed per day
-• Only BUY if cash is available; only SELL positions we actually hold
-
-TASK:
-Propose 0–3 trades. Return ONLY a valid JSON array — no prose, no markdown, no comments.
-Each element must have exactly these keys:
-  "ticker"            – one of: {tickers_str}
-  "action"            – "BUY" or "SELL"
-  "pct_of_portfolio"  – integer 1–{int(MAX_POSITION_PCT*100)} (% of total portfolio value to trade)
-  "reasoning"         – one concise sentence
-
-Return an empty array [] if no trade is warranted today."""
-
-    @staticmethod
-    def _parse_json(text: str) -> list[dict]:
-        m = _JSON_BLOCK.search(text)
-        if m:
-            text = m.group(1).strip()
-        try:
-            data = json.loads(text)
-            if isinstance(data, list):
-                return data
-        except json.JSONDecodeError:
-            pass
-        start = text.find("[")
-        end   = text.rfind("]") + 1
-        if start != -1 and end > start:
+        # ── Primary: Claude tool-use ──────────────────────────────────────
+        import config as _cfg   # re-read at call time so a late-loaded key is picked up
+        _api_key = _cfg.API_KEY
+        _model   = _cfg.MODEL
+        if _api_key:
             try:
-                data = json.loads(text[start:end])
-                if isinstance(data, list):
-                    return data
-            except json.JSONDecodeError:
-                pass
-        return []
+                proposals = self._llm_proposals(analysis, portfolio, _api_key, _model)
+                n_sell = sum(1 for p in proposals if p["action"] == "SELL")
+                n_buy  = sum(1 for p in proposals if p["action"] == "BUY")
+                self.reasoning = (
+                    f"[Claude AI] Liquidating {n_sell} position(s); "
+                    f"buying {n_buy} high-vol S&P 500 losers (3–5 picks)."
+                )
+                return proposals
+            except Exception as exc:
+                logger.warning(
+                    "LLM strategy failed (%s) — using deterministic fallback.", exc
+                )
+                self.api_failed = True
+                self.api_error  = str(exc)
 
-    # ── Rule-based fallback ───────────────────────────────────────────────────
-    # ─────────────────────────────────────────────────────────────────────────
-    # RULE IMPLEMENTATIONS
-    # ── These methods will be replaced with the actual strategy rules
-    #    once provided by the user.  Current logic is a temporary placeholder.
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _rule_propose(self, analysis: dict[str, dict], portfolio: dict) -> list[dict]:
-        if self.strategy == "Momentum":
-            proposals = self._rules_momentum(analysis, portfolio)
-        else:
-            proposals = self._rules_mean_reversion(analysis, portfolio)
-
+        # ── Fallback: hard-coded deterministic logic ──────────────────────
+        proposals = self._build_proposals(analysis, portfolio)
+        n_sell = sum(1 for p in proposals if p["action"] == "SELL")
+        n_buy  = sum(1 for p in proposals if p["action"] == "BUY")
         self.reasoning = (
-            f"[Rule-based {self.strategy}] Proposed {len(proposals)} trade(s)."
+            f"[Deterministic Fallback] Liquidating {n_sell} position(s); "
+            f"buying {n_buy} highest-vol S&P 500 losers (RSI-gated 3–5 picks)."
         )
         return proposals
 
-    def _rules_momentum(self, analysis: dict[str, dict], portfolio: dict) -> list[dict]:
+    # ── LLM path (Claude tool use) ────────────────────────────────────────────
+
+    def _llm_proposals(self, analysis: dict, portfolio: dict, api_key: str, model: str) -> list[dict]:
         """
-        MOMENTUM STRATEGY RULES
-        ── Placeholder — replace with actual rules.
+        Ask Claude to propose trades via the `submit_trade_proposals` tool.
+
+        Claude is given:
+          • Current portfolio state (positions, cash, total value)
+          • Top-50 S&P 500 stocks ranked by 5-day realised volatility,
+            with all key indicators, sorted by prev-day loss (biggest first)
+
+        It must call `submit_trade_proposals` exactly once with the full
+        trade list (SELLs first, then BUYs).
         """
-        proposals: list[dict] = []
+        client    = anthropic.Anthropic(api_key=api_key)
         total     = portfolio["total_value"]
         cash      = portfolio["cash"]
         positions = portfolio.get("positions", {})
 
-        ranked = sorted(analysis.items(), key=lambda kv: kv[1]["momentum_20d"], reverse=True)
+        # ── Build top-50 universe sorted by prev-day loss ─────────────────
+        vol_sorted = sorted(
+            analysis.items(),
+            key=lambda kv: kv[1].get("realized_vol_5d", 0.0),
+            reverse=True,
+        )[:50]
 
-        for ticker, m in ranked[:3]:
-            if len(proposals) >= 3:
-                break
-            if ticker not in positions and cash > total * 0.15 and m["momentum_20d"] > 1.0:
-                proposals.append({
-                    "ticker":           ticker,
-                    "action":           "BUY",
-                    "pct_of_portfolio": 20,
-                    "reasoning":        f"Placeholder momentum rule: {m['momentum_20d']:+.1f}% 20d return.",
-                })
+        candidates = sorted(
+            vol_sorted,
+            key=lambda kv: kv[1].get("prev_day_return", 0.0),   # most negative first
+        )
 
-        for ticker, m in ranked[-3:]:
-            if len(proposals) >= 3:
-                break
-            if ticker in positions and m["momentum_20d"] < -2.0:
-                proposals.append({
-                    "ticker":           ticker,
-                    "action":           "SELL",
-                    "pct_of_portfolio": round(positions[ticker]["value"] / total * 100),
-                    "reasoning":        f"Placeholder momentum rule: {m['momentum_20d']:+.1f}% 20d return.",
-                })
+        # ── Format context strings ────────────────────────────────────────
+        pos_lines = "\n".join(
+            f"  {sym:6s}  {pos['shares']:.2f} sh @ ${pos['average_cost']:.2f} avg  "
+            f"mkt=${pos['value']:,.0f}  unrealised={pos['pnl_pct']:+.1f}%"
+            for sym, pos in positions.items()
+        ) or "  (none — fully in cash)"
 
-        return proposals
+        universe_lines = "\n".join(
+            f"  {sym:6s}  5d_vol={m['realized_vol_5d']:.1%}  "
+            f"prev_day={m['prev_day_return']:+.2f}%  "
+            f"rsi={m.get('rsi', 0):.0f}  "
+            f"mom_20d={m.get('momentum_20d', 0):+.1f}%  "
+            f"price=${m['price']:.2f}"
+            for sym, m in candidates
+        )
 
-    def _rules_mean_reversion(self, analysis: dict[str, dict], portfolio: dict) -> list[dict]:
-        """
-        MEAN REVERSION STRATEGY RULES
-        ── Placeholder — replace with actual rules.
-        """
+        system_prompt = (
+            "You are an algorithmic trading agent executing a high-volatility "
+            "mean-reversion strategy on S&P 500 stocks.\n\n"
+            "STRATEGY RULES (follow exactly)\n"
+            "──────────────────────────────\n"
+            "1. SELL every currently held position in full (liquidation before rebalance).\n"
+            "2. You are given the top-50 S&P 500 stocks ranked by 5-day realised "
+            "volatility — the most violently moving stocks in the market right now.\n"
+            "3. From that high-vol universe, identify the 3 to 5 stocks with the "
+            "largest previous-day percentage LOSS. These are your mean-reversion "
+            "buy candidates — yesterday's biggest losers in the most volatile names.\n"
+            "4. Decide exactly how many to buy (3, 4, or 5) based on conviction:\n"
+            "   • 3 picks → high conviction (e.g. extreme RSI oversold + deep loss + "
+            "strong prior momentum). Allocate ~33 % each.\n"
+            "   • 4 picks → moderate conviction. Allocate ~25 % each.\n"
+            "   • 5 picks → broad spread when multiple candidates look similar. "
+            "Allocate 20 % each.\n"
+            "5. BUY equal allocations across your chosen picks (percentages must "
+            "sum to 100 % of portfolio value).\n\n"
+            "Think step-by-step:\n"
+            "  a) List the SELLs needed to liquidate current positions.\n"
+            "  b) Scan the universe table for the worst prev_day losers.\n"
+            "  c) Check RSI and 20d momentum — do they confirm an oversold bounce "
+            "thesis? Use that signal to decide 3, 4, or 5 picks.\n"
+            "  d) State your pick count and per-stock allocation percentage.\n"
+            "  e) Call `submit_trade_proposals` with your complete trade list."
+        )
+
+        user_msg = (
+            f"TODAY'S REBALANCE\n"
+            f"─────────────────\n"
+            f"Portfolio value: ${total:,.0f}   Cash available: ${cash:,.0f}\n\n"
+            f"CURRENT POSITIONS (all to be liquidated)\n"
+            f"─────────────────────────────────────────\n"
+            f"{pos_lines}\n\n"
+            f"TOP-50 S&P 500 STOCKS BY 5-DAY REALISED VOLATILITY\n"
+            f"(sorted by previous-day return — most negative first)\n"
+            f"────────────────────────────────────────────────────\n"
+            f"{universe_lines}\n\n"
+            "Step through the rules: identify the 3–5 worst losers from this "
+            "high-vol universe, decide how many to buy based on signal conviction, "
+            "then call `submit_trade_proposals` with your full trade list."
+        )
+
+        submit_tool = {
+            "name": "submit_trade_proposals",
+            "description": (
+                "Submit the final, complete list of trade proposals "
+                "(SELLs and BUYs) to the risk-management and execution agents. "
+                "Call this exactly once."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "trades": {
+                        "type": "array",
+                        "description": "All trade proposals for today's rebalance",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "ticker": {
+                                    "type":        "string",
+                                    "description": "Stock ticker symbol (e.g. AAPL)",
+                                },
+                                "action": {
+                                    "type":        "string",
+                                    "enum":        ["BUY", "SELL"],
+                                    "description": "Trade direction",
+                                },
+                                "pct_of_portfolio": {
+                                    "type":        "number",
+                                    "description": (
+                                        "Percentage of total portfolio value. "
+                                        "For SELLs: use current position weight. "
+                                        "For BUYs: equal split across picks — "
+                                        "~33 for 3 picks, 25 for 4, 20 for 5. "
+                                        "All BUY pct_of_portfolio values must sum to 100."
+                                    ),
+                                },
+                                "reasoning": {
+                                    "type":        "string",
+                                    "description": (
+                                        "One-sentence rationale referencing "
+                                        "vol, prev-day loss, RSI, or momentum"
+                                    ),
+                                },
+                            },
+                            "required": [
+                                "ticker", "action", "pct_of_portfolio", "reasoning"
+                            ],
+                        },
+                    }
+                },
+                "required": ["trades"],
+            },
+        }
+
+        response = client.messages.create(
+            model=model,
+            max_tokens=2048,
+            system=system_prompt,
+            tools=[submit_tool],
+            tool_choice={"type": "tool", "name": "submit_trade_proposals"},
+            messages=[{"role": "user", "content": user_msg}],
+        )
+
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "submit_trade_proposals":
+                return block.input["trades"]
+
+        raise ValueError(
+            "Claude did not call submit_trade_proposals — "
+            f"stop_reason={response.stop_reason}"
+        )
+
+    # ── Deterministic fallback ────────────────────────────────────────────────
+
+    def _build_proposals(
+        self,
+        analysis:  dict[str, dict],
+        portfolio: dict,
+    ) -> list[dict]:
         proposals: list[dict] = []
         total     = portfolio["total_value"]
-        cash      = portfolio["cash"]
         positions = portfolio.get("positions", {})
 
-        for ticker, m in sorted(analysis.items(), key=lambda kv: kv[1]["zscore"]):
-            if len(proposals) >= 3:
-                break
-            if m["zscore"] < -1.1 and ticker not in positions and cash > total * 0.15:
-                proposals.append({
-                    "ticker":           ticker,
-                    "action":           "BUY",
-                    "pct_of_portfolio": 20,
-                    "reasoning":        f"Placeholder mean-rev rule: z={m['zscore']:+.2f} (oversold).",
-                })
+        # Step 1: liquidate every current position
+        for ticker, pos in positions.items():
+            pct = max(1, round(pos["value"] / total * 100))
+            proposals.append({
+                "ticker":           ticker,
+                "action":           "SELL",
+                "pct_of_portfolio": pct,
+                "reasoning":        "Full liquidation before daily rebalance.",
+            })
 
-        for ticker, m in sorted(analysis.items(), key=lambda kv: kv[1]["zscore"], reverse=True):
-            if len(proposals) >= 3:
-                break
-            if m["zscore"] > 1.1 and ticker in positions:
-                proposals.append({
-                    "ticker":           ticker,
-                    "action":           "SELL",
-                    "pct_of_portfolio": round(positions[ticker]["value"] / total * 100),
-                    "reasoning":        f"Placeholder mean-rev rule: z={m['zscore']:+.2f} (overbought).",
-                })
+        # Step 2: rank S&P 500 universe by 5-day realised volatility
+        vol_ranked = sorted(
+            analysis.items(),
+            key=lambda kv: kv[1].get("realized_vol_5d", 0.0),
+            reverse=True,
+        )
+        top_50 = vol_ranked[:50]
+
+        # Step 3: from top-50, pick the 3–5 biggest previous-day losers.
+        # Decide count by RSI: deeply oversold (RSI < 30) → fewer, higher-conviction
+        # picks; more moderate → broader spread.
+        loss_ranked = sorted(
+            top_50,
+            key=lambda kv: kv[1].get("prev_day_return", 0.0),
+        )
+        candidates = loss_ranked[:5]   # always consider at most 5
+
+        if not candidates:
+            logger.warning("StrategyAgent: no picks found — check analysis data.")
+            return proposals
+
+        # Count picks: if ≥2 of the top-5 have RSI < 30 → use 3 picks (high
+        # conviction on the most oversold); otherwise spread across 4 or 5.
+        oversold_count = sum(
+            1 for _, m in candidates if m.get("rsi", 50) < 30
+        )
+        if oversold_count >= 2:
+            n_picks = 3
+        elif oversold_count == 1:
+            n_picks = 4
+        else:
+            n_picks = 5
+
+        picks = candidates[:n_picks]
+        alloc_pct = round(100 / n_picks)   # equal weight
+
+        # Step 4: equal-weight BUY
+        for ticker, m in picks:
+            proposals.append({
+                "ticker":           ticker,
+                "action":           "BUY",
+                "pct_of_portfolio": alloc_pct,
+                "reasoning": (
+                    f"5d vol {m['realized_vol_5d']:.1%} (top-50 universe); "
+                    f"prev-day {m['prev_day_return']:+.2f}% loss; "
+                    f"RSI {m.get('rsi', 0):.0f}. "
+                    f"Buying {n_picks} picks at {alloc_pct}% each."
+                ),
+            })
 
         return proposals
