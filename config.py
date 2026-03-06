@@ -46,7 +46,7 @@ API_KEY: str = _extract_api_key()
 MODEL = "claude-3-5-haiku-20241022"          # fast & cheap for an agentic loop
 
 # ─── Simulation parameters ─────────────────────────────────────────────────
-INITIAL_CAPITAL: float = 100_000.0
+INITIAL_CAPITAL: float = 1_000_000.0
 SIMULATION_DAYS: int = 5                     # 1 trading week
 
 # ─── Risk constraints ──────────────────────────────────────────────────────
@@ -59,14 +59,6 @@ MEAN_REV_WINDOW: int = 20                    # days for z-score calculation
 RSI_WINDOW: int = 14
 LOOKBACK_DAYS: int = 30                      # minimum history needed
 
-# ─── Universe ──────────────────────────────────────────────────────────────
-ETF_TICKERS: list[str] = [
-    "SPY", "QQQ", "IWM",   # US equity
-    "EFA", "EEM",           # International equity
-    "GLD", "TLT",           # Defensive / bonds
-    "VNQ", "XLE", "XLF",   # Sector ETFs
-]
-
 # ─── Paths ─────────────────────────────────────────────────────────────────
 DB_PATH  = str(_PROJECT_ROOT / "portfolio.db")
-CSV_PATH = str(_PROJECT_ROOT / "data" / "etf_prices.csv")
+CSV_PATH = str(_PROJECT_ROOT / "data" / "sp500_prices.csv")
