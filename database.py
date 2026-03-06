@@ -13,6 +13,7 @@ daily_snapshots  – daily snapshot of total equity for plotting
 sp500_stocks     – S&P 500 stock cache with OHLCV + price_date / fetch_date
 """
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from typing import Any
@@ -100,6 +101,12 @@ class PortfolioDatabase:
                     price_date TEXT,
                     PRIMARY KEY (symbol, fetch_date)
                 );
+
+                CREATE TABLE IF NOT EXISTS day_results (
+                    day_num     INTEGER PRIMARY KEY,
+                    date        TEXT    NOT NULL,
+                    result_json TEXT    NOT NULL
+                );
             """)
 
         # ── Migrations: safely add columns that didn't exist in older DBs ─
@@ -124,6 +131,7 @@ class PortfolioDatabase:
             c.execute("DELETE FROM position_history")
             c.execute("DELETE FROM transactions")
             c.execute("DELETE FROM daily_snapshots")
+            c.execute("DELETE FROM day_results")
             c.execute(
                 "INSERT INTO simulation (id, cash_balance, total_portfolio_value, last_advance_date)"
                 " VALUES (1, ?, ?, '')",
@@ -138,6 +146,7 @@ class PortfolioDatabase:
             c.execute("DELETE FROM position_history")
             c.execute("DELETE FROM transactions")
             c.execute("DELETE FROM daily_snapshots")
+            c.execute("DELETE FROM day_results")
             c.execute("DELETE FROM sp500_stocks")
             c.execute(
                 "INSERT INTO simulation (id, cash_balance, total_portfolio_value, last_advance_date)"
@@ -423,3 +432,28 @@ class PortfolioDatabase:
                 "SELECT DISTINCT fetch_date FROM sp500_stocks ORDER BY fetch_date DESC"
             ).fetchall()
             return [r["fetch_date"] for r in rows]
+
+    # ── Day-result persistence (for cross-session state restore) ─────────────
+
+    def has_simulation(self) -> bool:
+        """Returns True if a simulation row (id=1) exists in the DB."""
+        with self._conn() as c:
+            row = c.execute("SELECT id FROM simulation WHERE id = 1").fetchone()
+            return row is not None
+
+    def save_day_result(self, result: dict) -> None:
+        """Persist a completed simulation day as a JSON blob."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO day_results (day_num, date, result_json)"
+                " VALUES (?, ?, ?)",
+                (result["day_num"], result["date"], json.dumps(result, default=str)),
+            )
+
+    def load_all_day_results(self) -> list[dict]:
+        """Load all persisted daily results ordered by day number."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT result_json FROM day_results ORDER BY day_num"
+            ).fetchall()
+        return [json.loads(r["result_json"]) for r in rows]

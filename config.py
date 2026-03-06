@@ -43,7 +43,7 @@ def _extract_api_key() -> str:
 API_KEY: str = _extract_api_key()
 
 # ─── Model ─────────────────────────────────────────────────────────────────
-MODEL = "claude-3-5-haiku-20241022"          # fast & cheap for an agentic loop
+MODEL = "claude-haiku-4-5-20251001"          # fast & cheap for an agentic loop
 
 # ─── Simulation parameters ─────────────────────────────────────────────────
 INITIAL_CAPITAL: float = 1_000_000.0
@@ -51,7 +51,7 @@ SIMULATION_DAYS: int = 5                     # 1 trading week
 
 # ─── Risk constraints ──────────────────────────────────────────────────────
 MAX_POSITION_PCT: float = 0.40               # 40 % max single-position weight
-MAX_TRADES_PER_DAY: int = 2
+MAX_TRADES_PER_DAY: int = 20   # liquidate N positions + buy 5 = up to ~10/day
 
 # ─── Technical-analysis look-back windows ──────────────────────────────────
 MOMENTUM_WINDOW: int = 20                    # days for momentum calculation

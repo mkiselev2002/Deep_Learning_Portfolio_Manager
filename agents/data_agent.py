@@ -114,13 +114,29 @@ class DataAgent:
             # SMA filter
             sma20 = float(series.iloc[-MOMENTUM_WINDOW:].mean())
 
+            # 5-day realized volatility (annualized std dev of daily log returns)
+            if len(series) >= 7:
+                recent_6 = series.iloc[-6:]
+                log_rets = np.log(recent_6 / recent_6.shift(1)).dropna()
+                realized_vol_5d = float(log_rets.std() * np.sqrt(252))
+            else:
+                realized_vol_5d = 0.0
+
+            # Previous trading day return
+            prev_day_return = (
+                (price / float(series.iloc[-2]) - 1.0) * 100.0
+                if len(series) >= 2 else 0.0
+            )
+
             result[ticker] = {
-                "price":        round(price,   2),
-                "momentum_20d": round(mom_20d, 2),
-                "momentum_5d":  round(mom_5d,  2),
-                "zscore":       round(zscore,  3),
-                "rsi":          round(rsi,     1),
-                "above_sma20":  price > sma20,
+                "price":            round(price,           2),
+                "momentum_20d":     round(mom_20d,         2),
+                "momentum_5d":      round(mom_5d,          2),
+                "zscore":           round(zscore,           3),
+                "rsi":              round(rsi,              1),
+                "above_sma20":      price > sma20,
+                "realized_vol_5d":  round(realized_vol_5d, 4),
+                "prev_day_return":  round(prev_day_return,  4),
             }
 
         return result
@@ -155,6 +171,14 @@ class DataAgent:
         # ── Position detail ──────────────────────────────────────────────
         positions_detail = []
         for ticker, pos in portfolio["positions"].items():
+            # Compute yesterday's price change from the price history CSV
+            yesterday_chg = None
+            if ticker in prices_df.columns:
+                series = prices_df[ticker].dropna()
+                if len(series) >= 2:
+                    yesterday_chg = round(
+                        (float(series.iloc[-1]) / float(series.iloc[-2]) - 1.0) * 100.0, 2
+                    )
             positions_detail.append({
                 "ticker":        ticker,
                 "shares":        round(pos["shares"], 4),
@@ -163,26 +187,27 @@ class DataAgent:
                 "value":         round(pos["value"], 2),
                 "pnl_pct":       round(pos["pnl_pct"], 2),
                 "pnl_dollar":    round(pos["value"] - pos["shares"] * pos["average_cost"], 2),
+                "yesterday_chg": yesterday_chg,   # % move in latest session
             })
 
         positions_detail.sort(key=lambda x: x["pnl_pct"], reverse=True)
-        top_performers   = [p for p in positions_detail if p["pnl_pct"] > 0][:3]
-        underperformers  = [p for p in positions_detail if p["pnl_pct"] < 0][:3]
+        top_performers  = [p for p in positions_detail if p["pnl_pct"] > 0][:3]
+        underperformers = [p for p in positions_detail if p["pnl_pct"] < 0][:3]
 
-        # ── News headlines ───────────────────────────────────────────────
+        # ── News headlines — held tickers first, then broad market ───────
         held_tickers = [p["ticker"] for p in positions_detail]
         news = self._fetch_news(held_tickers) if held_tickers else {}
 
         # ── Build context dict ───────────────────────────────────────────
         context = {
-            "generated_date":   today,
-            "portfolio_value":  round(portfolio["total_value"], 2),
-            "cash":             round(portfolio["cash"], 2),
-            "initial_capital":  INITIAL_CAPITAL,
-            "positions":        positions_detail,
-            "top_performers":   top_performers,
-            "underperformers":  underperformers,
-            "news_headlines":   news,
+            "generated_date":  today,
+            "portfolio_value": round(portfolio["total_value"], 2),
+            "cash":            round(portfolio["cash"], 2),
+            "initial_capital": INITIAL_CAPITAL,
+            "positions":       positions_detail,
+            "top_performers":  top_performers,
+            "underperformers": underperformers,
+            "news_headlines":  news,
             **metrics,
         }
 
@@ -269,30 +294,77 @@ class DataAgent:
     # ── AI narrative ──────────────────────────────────────────────────────────
 
     def _generate_summary(self, context: dict) -> str:
-        if API_KEY:
-            return self._llm_summary(context)
+        import config as _cfg   # re-read at call time so a late-loaded key is picked up
+        if _cfg.API_KEY:
+            return self._llm_summary(context, _cfg.API_KEY, _cfg.MODEL)
         return self._rule_based_summary(context)
 
-    def _llm_summary(self, context: dict) -> str:
+    def _llm_summary(self, context: dict, api_key: str, model: str) -> str:
         """Ask Claude to write the portfolio narrative."""
-        # Build a compact representation for the prompt
-        positions_text = "\n".join(
-            f"  {p['ticker']}: ${p['value']:,.0f}  P/L {p['pnl_pct']:+.1f}%"
-            for p in context["positions"]
-        ) or "  (no open positions)"
 
+        # ── Per-position block with yesterday's move ──────────────────────
+        pos_lines = []
+        for p in context["positions"]:
+            yday = (
+                f"  ↕ yesterday {p['yesterday_chg']:+.1f}%"
+                if p.get("yesterday_chg") is not None
+                else ""
+            )
+            pos_lines.append(
+                f"  {p['ticker']:6s}  value=${p['value']:>10,.0f}"
+                f"  unrealised={p['pnl_pct']:+.1f}%"
+                f"  (entry ${p['avg_cost']:.2f} → now ${p['current_price']:.2f})"
+                f"{yday}"
+            )
+        positions_text = "\n".join(pos_lines) or "  (no open positions — fully in cash)"
+
+        # ── News block: held tickers first, labelled ──────────────────────
         news_text = ""
+        held = set(p["ticker"] for p in context["positions"])
+        # Held-ticker news first
         for ticker, headlines in context.get("news_headlines", {}).items():
+            if ticker not in held:
+                continue
+            news_text += f"\n  ★ {ticker} (HELD):\n"
+            for h in headlines:
+                news_text += f"      • {h}\n"
+        # Then any other tickers (shouldn't exist given current fetch logic, but future-proof)
+        for ticker, headlines in context.get("news_headlines", {}).items():
+            if ticker in held:
+                continue
             news_text += f"\n  {ticker}:\n"
             for h in headlines:
-                news_text += f"    • {h}\n"
+                news_text += f"      • {h}\n"
         if not news_text:
-            news_text = "  (no headlines available)"
+            news_text = "\n  (no headlines available for held positions)"
+
+        # ── Strategy reminder ─────────────────────────────────────────────
+        strategy_note = (
+            "NOTE: This portfolio runs a high-volatility mean-reversion strategy. "
+            "Every day it liquidates all positions and buys the 5 S&P 500 stocks "
+            "with the highest 5-day realised volatility that fell the most the "
+            "previous day. Gains come from overnight mean-reversion bounces in "
+            "beaten-down, volatile names."
+        )
+
+        # Inject a Day-1 warning so Claude doesn't fabricate prior-day comparisons
+        is_day_one = context.get("total_days", 0) <= 1
+        day1_note  = (
+            "\n⚠️ DAY 1 ALERT: This is the very first trading session — positions were "
+            "just opened today. There is NO prior portfolio value to compare against. "
+            "All P/L figures are zero or trivial noise; do NOT describe the portfolio "
+            "as 'up' or 'down'. Do NOT reference 'yesterday's performance' of the book. "
+            "Instead describe the mean-reversion thesis for the names just entered and "
+            "what signals to watch for the first overnight hold.\n"
+            if is_day_one else ""
+        )
 
         prompt = f"""You are a sharp portfolio analyst writing a daily briefing for a paper trading desk.
 
-PORTFOLIO SNAPSHOT  ({context['generated_date']})
-──────────────────────────────────────────────────
+{strategy_note}{day1_note}
+
+PORTFOLIO SNAPSHOT  ({context['generated_date']})  —  Day {context['total_days']} of simulation
+──────────────────────────────────────────────────────────────────────────────
 Total Value:   ${context['portfolio_value']:,.2f}
 Cash:          ${context['cash']:,.2f}
 All-time P/L:  ${context['alltime_pnl']:+,.2f}  ({context['alltime_pnl_pct']:+.2f}%)
@@ -300,39 +372,51 @@ All-time P/L:  ${context['alltime_pnl']:+,.2f}  ({context['alltime_pnl_pct']:+.2
 Yesterday P/L: ${context['daily_pnl']:+,.2f}  ({context['daily_pnl_pct']:+.2f}%)
 Win Rate:      {context['win_rate']:.0f}%  ({context['total_days']} trading days)
 
-POSITIONS
-─────────
+CURRENT POSITIONS (with yesterday's price move)
+────────────────────────────────────────────────
 {positions_text}
 
-RECENT NEWS HEADLINES
-─────────────────────{news_text}
+NEWS HEADLINES FOR HELD POSITIONS (★ = currently held)
+───────────────────────────────────────────────────────{news_text}
 
-Write a punchy 3-paragraph briefing:
-1. OVERALL: Portfolio value, trend, and all-time / 5-day performance in plain English.
-2. WINNERS & LOSERS: What's working and what isn't — be specific with tickers and numbers.
-3. MARKET CONTEXT: Using the news headlines, what macro or sector forces likely explain the moves? If no news, make an educated guess based on the tickers.
+Write a concise 3-paragraph briefing. Strict formatting rules:
+- NEVER use markdown headers (no #, ##, ###)
+- NO bullet points or dashes
+- NO backtick code spans (never wrap numbers or words in backticks)
+- Each paragraph: 2–3 sentences maximum
+- Start each paragraph with an inline bold label exactly as written below
 
-Keep it concise, analytical, and slightly high-stakes. No bullet points — flowing prose only."""
+**PERFORMANCE:** Are we up or down overall and yesterday? Name the biggest movers and their dollar impact on the book. (If Day 1, skip P/L comparison — describe the positions just opened.)
+
+**DRIVERS:** What news or price action explains the moves in our held names? Connect specific events to specific P/L.
+
+**STRATEGY:** Is mean-reversion working or failing today? One concrete thing to watch on the next trading day.
+
+Analytical, high-stakes tone. Every number must come from the data above."""
 
         try:
-            client   = anthropic.Anthropic(api_key=API_KEY)
+            client   = anthropic.Anthropic(api_key=api_key)
             response = client.messages.create(
-                model=MODEL,
-                max_tokens=600,
+                model=model,
+                max_tokens=450,
                 messages=[{"role": "user", "content": prompt}],
             )
             return response.content[0].text.strip()
         except Exception as exc:
             logger.warning("LLM summary failed (%s) — using fallback.", exc)
+            context["_summary_error"] = str(exc)
             return self._rule_based_summary(context)
 
     def _rule_based_summary(self, context: dict) -> str:
         """Deterministic fallback summary when the LLM is unavailable."""
-        pv   = context["portfolio_value"]
-        pnl  = context["alltime_pnl"]
-        ppct = context["alltime_pnl_pct"]
-        fpct = context["fiveday_pnl_pct"]
-        sign = "up" if pnl >= 0 else "down"
+        pv    = context["portfolio_value"]
+        pnl   = context["alltime_pnl"]
+        ppct  = context["alltime_pnl_pct"]
+        fpct  = context["fiveday_pnl_pct"]
+        dpnl  = context["daily_pnl"]
+        dpct  = context["daily_pnl_pct"]
+        sign  = "up" if pnl >= 0 else "down"
+        dsign = "gained" if dpnl >= 0 else "lost"
 
         winners = ", ".join(
             f"{p['ticker']} ({p['pnl_pct']:+.1f}%)"
@@ -343,18 +427,33 @@ Keep it concise, analytical, and slightly high-stakes. No bullet points — flow
             for p in context["underperformers"]
         ) or "none"
 
-        api_note = (
-            "(AI summary temporarily unavailable — rule-based fallback in use.)"
-            if API_KEY
-            else "(Connect a Claude API key for a full AI-generated market context analysis.)"
+        # Per-position yesterday move summary
+        moves = []
+        for p in context["positions"]:
+            if p.get("yesterday_chg") is not None:
+                moves.append(f"{p['ticker']} {p['yesterday_chg']:+.1f}%")
+        moves_text = (
+            "Yesterday's moves for held names: " + ", ".join(moves) + "."
+            if moves else ""
         )
 
+        _err = context.get("_summary_error")
+        if _err:
+            api_note = f"⚠️ Claude API error: {_err}"
+        elif API_KEY:
+            api_note = "⚠️ AI narrative unavailable — rule-based fallback in use."
+        else:
+            api_note = "ℹ️ Connect a Claude API key for AI-generated market analysis."
+
         return (
-            f"Portfolio is currently valued at ${pv:,.2f}, {sign} "
-            f"${abs(pnl):,.2f} ({ppct:+.2f}%) from the initial ${context['initial_capital']:,.0f} stake. "
-            f"Over the last 5 trading days the book moved {fpct:+.2f}%, "
-            f"with a win rate of {context['win_rate']:.0f}% across {context['total_days']} recorded days.\n\n"
-            f"Top performers: {winners}. "
-            f"Underperformers: {losers}.\n\n"
+            f"Portfolio valued at ${pv:,.2f}, {sign} "
+            f"${abs(pnl):,.2f} ({ppct:+.2f}%) from the initial "
+            f"${context['initial_capital']:,.0f} stake. "
+            f"Yesterday the book {dsign} ${abs(dpnl):,.2f} ({dpct:+.2f}%), "
+            f"and over the last 5 trading days it moved {fpct:+.2f}%. "
+            f"Win rate: {context['win_rate']:.0f}% across "
+            f"{context['total_days']} recorded day(s).\n\n"
+            f"Top performers: {winners}. Underperformers: {losers}. "
+            f"{moves_text}\n\n"
             f"{api_note}"
         )
