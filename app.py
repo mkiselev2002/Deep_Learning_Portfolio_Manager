@@ -1631,22 +1631,75 @@ def main():
     _today     = date.today()
     _date_part = f"{_ordinal(_today.day)} {_today.strftime('%B %Y')}"
     if st.session_state["sim_started"] and st.session_state["daily_results"]:
-        _day_label = f"DAY&nbsp;{st.session_state['sim_day_num'] - 1}"
+        _day_label = f"DAY {st.session_state['sim_day_num'] - 1}"
     else:
-        _day_label = "DAY&nbsp;—"
+        _day_label = "DAY —"
 
-    c_date, c_start, c_deal, c_rou, c_api = st.columns([2, 2, 2, 1, 2])
+    # ── Row 1: Centered info cards ────────────────────────────────────────────
+    _, c_date, c_deal, _ = st.columns([1, 2, 2, 1])
 
     with c_date:
         st.markdown(
-            f"<div style='padding:0.35rem 0; line-height:1.4;'>"
-            f"<div style='font-family:monospace; font-size:0.95rem; font-weight:900; "
-            f"color:#f59e0b; letter-spacing:0.02em;'>{_date_part}</div>"
-            f"<div style='font-size:0.68rem; font-weight:800; color:#6b7280; "
-            f"text-transform:uppercase; letter-spacing:0.14em;'>{_day_label}</div>"
+            f"<div style='background:rgba(255,255,255,0.03); border:1px solid rgba(245,158,11,0.28); "
+            f"border-radius:12px; padding:0.9rem 1.2rem; text-align:center;'>"
+            f"<div style='font-size:0.58rem; font-weight:800; color:#f59e0b; text-transform:uppercase; "
+            f"letter-spacing:0.18em; margin-bottom:0.45rem;'>📅 Trading Date</div>"
+            f"<div style='font-family:monospace; font-size:1.1rem; font-weight:900; color:#f1f5f9; "
+            f"letter-spacing:0.02em;'>{_date_part}</div>"
+            f"<div style='font-size:0.65rem; font-weight:700; color:#6b7280; margin-top:0.2rem; "
+            f"text-transform:uppercase; letter-spacing:0.12em;'>{_day_label}</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
+
+    with c_deal:
+        with st.container(border=True):
+            st.markdown(
+                "<div style='font-size:0.58rem; font-weight:800; color:#f59e0b; "
+                "text-transform:uppercase; letter-spacing:0.18em; margin-bottom:0.35rem; "
+                "text-align:center;'>📈 Next Move</div>",
+                unsafe_allow_html=True,
+            )
+            if st.session_state["sim_started"] and not dates_remaining:
+                st.success("All hands dealt", icon="🏁")
+            else:
+                if already_ran_today and dates_remaining:
+                    st.markdown(
+                        "<div style='font-size:0.65rem; color:#f59e0b; font-weight:700; "
+                        "text-align:center; padding-bottom:0.2rem;'>⏳ Come back tomorrow</div>",
+                        unsafe_allow_html=True,
+                    )
+                if st.button("📈  Deal Next Hand", disabled=not can_advance,
+                             use_container_width=True):
+                    _deal_next_hand(db)
+
+    # ── Casino section ────────────────────────────────────────────────────────
+    st.markdown(
+        "<div style='display:flex; align-items:center; gap:0.8rem; "
+        "margin:1rem 0 0.6rem;'>"
+        "<div style='flex:1; height:1px; background:linear-gradient(90deg, "
+        "transparent, rgba(245,158,11,0.35));'></div>"
+        "<div style='font-size:0.58rem; font-weight:800; color:#f59e0b; "
+        "text-transform:uppercase; letter-spacing:0.22em; padding:0.2rem 0.75rem; "
+        "border:1px solid rgba(245,158,11,0.3); border-radius:20px; "
+        "background:rgba(245,158,11,0.06);'>🎰 Casino</div>"
+        "<div style='flex:1; height:1px; background:linear-gradient(270deg, "
+        "transparent, rgba(245,158,11,0.35));'></div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    _, c_casino, _ = st.columns([2, 3, 2])
+    with c_casino:
+        with st.container(border=True):
+            with st.popover("🎰  Open Roulette Table", use_container_width=True):
+                render_roulette()
+
+    # ── Bottom bar: Start New Game + API status ───────────────────────────────
+    st.markdown('<div class="ctrl-bottom-border" style="margin-top:0.9rem;"></div>',
+                unsafe_allow_html=True)
+
+    c_start, _, c_api = st.columns([2, 3, 2])
 
     with c_start:
         if st.button("🎲  Start New Game", type="primary", use_container_width=True):
@@ -1678,28 +1731,6 @@ def main():
                 "auto_deal":        True,
             })
             st.rerun()
-
-    with c_deal:
-        if st.session_state["sim_started"] and not dates_remaining:
-            st.success("All hands dealt", icon="🏁")
-        else:
-            if already_ran_today and dates_remaining:
-                st.markdown(
-                    "<div style='font-size:0.65rem; color:#f59e0b; font-weight:700; "
-                    "text-align:center; padding:0.15rem 0 0.1rem;'>"
-                    "⏳ Come back tomorrow</div>",
-                    unsafe_allow_html=True,
-                )
-            if st.button(
-                "📈  Deal Next Hand",
-                disabled=not can_advance,
-                use_container_width=True,
-            ):
-                _deal_next_hand(db)
-
-    with c_rou:
-        with st.popover("🎰", use_container_width=True):
-            render_roulette()
 
     with c_api:
         if API_KEY:
