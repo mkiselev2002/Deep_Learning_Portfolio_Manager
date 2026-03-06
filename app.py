@@ -460,8 +460,79 @@ def render_portfolio(db: PortfolioDatabase, daily_results: list[dict]):
 
     st.divider()
 
-    # ── Recent Executions ─────────────────────────────────────────────────────
-    st.markdown("**Recent Executions**")
+    # ── Position History (open + closed) ──────────────────────────────────────
+    st.markdown("**Position History** *(open & closed positions with dates)*")
+    hist_df = db.get_position_history()
+
+    if hist_df.empty:
+        st.info("No position history yet — start a simulation and execute some trades.")
+    else:
+        phdisp = hist_df.copy()
+
+        # Status badge
+        phdisp["Status"] = phdisp["closed_date"].apply(
+            lambda x: "🟢 Open" if (pd.isna(x) or x == "" or x is None) else "🔴 Closed"
+        )
+
+        # Format numeric columns safely
+        def _fmt_price(v):
+            try:
+                return f"${float(v):.2f}" if pd.notna(v) else "—"
+            except (TypeError, ValueError):
+                return "—"
+
+        def _fmt_pnl(v):
+            try:
+                f = float(v)
+                return f"${f:+,.2f}" if pd.notna(v) else "—"
+            except (TypeError, ValueError):
+                return "—"
+
+        def _fmt_pct(v):
+            try:
+                f = float(v)
+                return f"{f:+.2f}%" if pd.notna(v) else "—"
+            except (TypeError, ValueError):
+                return "—"
+
+        phdisp["Avg Cost"]    = phdisp["avg_cost"].map(_fmt_price)
+        phdisp["Exit Price"]  = phdisp["close_price"].map(_fmt_price)
+        phdisp["Realized P/L"]= phdisp["realized_pnl"].map(_fmt_pnl)
+        phdisp["P/L %"]       = phdisp["realized_pnl_pct"].map(_fmt_pct)
+        phdisp["Closed"]      = phdisp["closed_date"].apply(
+            lambda x: x if (pd.notna(x) and x not in ("", None)) else "—"
+        )
+
+        ph_show = phdisp[[
+            "symbol", "opened_date", "Closed", "shares",
+            "Avg Cost", "Exit Price", "Realized P/L", "P/L %", "Status",
+        ]].copy()
+        ph_show.columns = [
+            "Ticker", "Opened", "Closed", "Shares",
+            "Avg Cost", "Exit Price", "Realized P/L", "P/L %", "Status",
+        ]
+
+        def _color_pnl_str(val):
+            if not isinstance(val, str):
+                return ""
+            if val.startswith("+") or (val.startswith("$+") if val.startswith("$") else False):
+                return "color:#10b981; font-weight:700"
+            if val.startswith("-") or (val.startswith("$-") if val.startswith("$") else False):
+                return "color:#ef4444; font-weight:700"
+            # handle "$+..." and "$-..."
+            if len(val) > 1 and val[1] in ("+", "-"):
+                return "color:#10b981; font-weight:700" if val[1] == "+" else "color:#ef4444; font-weight:700"
+            return ""
+
+        st.dataframe(
+            ph_show.style.map(_color_pnl_str, subset=["Realized P/L", "P/L %"]),
+            hide_index=True, use_container_width=True,
+        )
+
+    st.divider()
+
+    # ── Trade Log ─────────────────────────────────────────────────────────────
+    st.markdown("**Trade Log** *(all executions)*")
     trades_df = db.get_trades()
 
     if trades_df.empty:
@@ -472,9 +543,29 @@ def render_portfolio(db: PortfolioDatabase, daily_results: list[dict]):
                 return "color:#10b981; font-weight:700"
             return "color:#ef4444; font-weight:700"
 
-        display = trades_df[["date", "action", "symbol", "shares", "price", "reason"]].copy()
-        display.columns = ["Date", "Action", "Ticker", "Qty", "Price", "Reasoning"]
-        display["Price"] = display["Price"].map("${:.2f}".format)
+        # Include `amount` column if it exists (added in updated schema)
+        cols_wanted = ["date", "action", "symbol", "shares", "price", "amount", "reason"]
+        cols_avail  = [c for c in cols_wanted if c in trades_df.columns]
+        display = trades_df[cols_avail].copy()
+
+        col_labels = {
+            "date":   "Date",
+            "action": "Action",
+            "symbol": "Ticker",
+            "shares": "Qty",
+            "price":  "Price",
+            "amount": "Total",
+            "reason": "Reasoning",
+        }
+        display.rename(columns=col_labels, inplace=True)
+
+        if "Price" in display.columns:
+            display["Price"] = display["Price"].map("${:.2f}".format)
+        if "Total" in display.columns:
+            display["Total"] = display["Total"].apply(
+                lambda v: f"${float(v):,.2f}" if pd.notna(v) else "—"
+            )
+
         st.dataframe(
             display.style.map(_color_action, subset=["Action"]),
             hide_index=True, use_container_width=True, height=300,
@@ -607,11 +698,25 @@ def render_market_data(db: PortfolioDatabase):
     gainers = int((df["change_pct"] > 0).sum())
     losers  = int((df["change_pct"] < 0).sum())
 
+    # Derive the actual market date of the price data (may lag fetch_date on weekends)
+    price_date = selected_date  # fallback
+    if "price_date" in df.columns:
+        _pd_vals = df["price_date"].dropna()
+        if not _pd_vals.empty:
+            price_date = str(_pd_vals.iloc[0])
+
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Stocks",       str(total))
     m2.metric("Winners",      str(gainers), delta=f"+{gainers}")
     m3.metric("Losers",       str(losers),  delta=f"-{losers}", delta_color="inverse")
-    m4.metric("As of",        selected_date)
+    m4.metric("Market Date",  price_date,
+              help=f"Actual trading date of the OHLCV data · Fetched: {selected_date}")
+
+    if price_date != selected_date:
+        st.caption(
+            f"ℹ️  Prices quoted as of **{price_date}** (last trading day) — "
+            f"fetched on {selected_date}."
+        )
 
     st.divider()
 

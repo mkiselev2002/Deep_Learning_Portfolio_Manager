@@ -1,8 +1,14 @@
 """
 market_data.py
 ──────────────
-Fetches real S&P 500 constituents from Wikipedia and today's stock prices
+Fetches real S&P 500 constituents from Wikipedia and stock prices
 via yfinance, then stores them in the local SQLite database.
+
+Two date concepts are tracked for sp500_stocks rows
+────────────────────────────────────────────────────
+• price_date  – the actual market date of the OHLCV quote returned by yfinance
+                (e.g. last Friday if today is Monday / a holiday)
+• fetch_date  – the calendar date we ran the fetch (today's date)
 """
 
 import io
@@ -43,7 +49,12 @@ def fetch_today_prices(tickers: list[str]) -> pd.DataFrame:
     """
     Downloads the latest available daily OHLCV data for a list of tickers.
     Uses a 5-day window so we always get data even when the market is closed.
-    Returns DataFrame with columns: symbol, open, high, low, close, volume.
+
+    Returns DataFrame with columns:
+        symbol, open, high, low, close, volume, price_date
+
+    price_date is the actual market trading date of the returned data —
+    which may be earlier than today if today is a weekend / holiday.
     """
     if not tickers:
         return pd.DataFrame()
@@ -67,14 +78,16 @@ def fetch_today_prices(tickers: list[str]) -> pd.DataFrame:
         sym = tickers[0]
         clean = raw.dropna(how="all")
         if not clean.empty:
-            r = clean.iloc[-1]
+            r           = clean.iloc[-1]
+            price_date  = clean.index[-1].strftime("%Y-%m-%d")
             rows.append({
-                "symbol": sym,
-                "open":   _safe_float(r.get("Open")),
-                "high":   _safe_float(r.get("High")),
-                "low":    _safe_float(r.get("Low")),
-                "close":  _safe_float(r.get("Close")),
-                "volume": _safe_int(r.get("Volume")),
+                "symbol":     sym,
+                "price_date": price_date,
+                "open":       _safe_float(r.get("Open")),
+                "high":       _safe_float(r.get("High")),
+                "low":        _safe_float(r.get("Low")),
+                "close":      _safe_float(r.get("Close")),
+                "volume":     _safe_int(r.get("Volume")),
             })
     else:
         # Multiple tickers: MultiIndex columns (price_type, ticker)
@@ -97,14 +110,16 @@ def fetch_today_prices(tickers: list[str]) -> pd.DataFrame:
             series = close_df[sym].dropna()
             if series.empty:
                 continue
-            last_idx = series.index[-1]
+            last_idx   = series.index[-1]
+            price_date = last_idx.strftime("%Y-%m-%d")
             rows.append({
-                "symbol": sym,
-                "open":   _safe_float(open_df[sym].get(last_idx)),
-                "high":   _safe_float(high_df[sym].get(last_idx)),
-                "low":    _safe_float(low_df[sym].get(last_idx)),
-                "close":  _safe_float(close_df[sym].get(last_idx)),
-                "volume": _safe_int(volume_df[sym].get(last_idx)),
+                "symbol":     sym,
+                "price_date": price_date,
+                "open":       _safe_float(open_df[sym].get(last_idx)),
+                "high":       _safe_float(high_df[sym].get(last_idx)),
+                "low":        _safe_float(low_df[sym].get(last_idx)),
+                "close":      _safe_float(close_df[sym].get(last_idx)),
+                "volume":     _safe_int(volume_df[sym].get(last_idx)),
             })
 
     return pd.DataFrame(rows)
@@ -162,6 +177,9 @@ def fetch_and_store_sp500(db) -> pd.DataFrame:
     """
     Main entry point: fetches S&P 500 constituents + latest prices,
     merges them, stores in DB, and returns the merged DataFrame.
+
+    The 'price_date' column records the actual market date of the OHLCV data
+    (may differ from fetch_date on weekends / market holidays).
     """
     constituents = get_sp500_constituents()
     tickers = constituents["symbol"].tolist()
@@ -171,7 +189,7 @@ def fetch_and_store_sp500(db) -> pd.DataFrame:
 
     if prices.empty:
         merged = constituents.copy()
-        for col in ("open", "high", "low", "close", "volume"):
+        for col in ("open", "high", "low", "close", "volume", "price_date"):
             merged[col] = None
     else:
         merged = constituents.merge(prices, on="symbol", how="left")
