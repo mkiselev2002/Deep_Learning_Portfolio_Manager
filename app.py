@@ -2930,7 +2930,7 @@ def main():
         _render_bt_setup()
         return
     if _new_game_stage == "bt_resetting":
-        _start_backtest_with_loading(db)
+        _start_backtest_with_loading(PortfolioDatabase(_get_session_backtest_db_path()))
         return
     if _new_game_stage == "bt_ready":
         _render_bt_ready()
