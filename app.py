@@ -2728,6 +2728,28 @@ def _start_new_game_with_loading(db: "PortfolioDatabase") -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Reset-guard dialog
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@st.dialog("🔐 Confirm Reset")
+def _confirm_reset_dialog() -> None:
+    """Password-protected gate for 'Start New Game'."""
+    st.warning("⚠️ This will permanently wipe all portfolio data and start fresh.")
+    pwd = st.text_input("Enter the secret word to continue:", type="password")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("✅  Confirm", type="primary", use_container_width=True):
+            if pwd == config.RESET_PASSWORD:
+                st.session_state["_reset_confirmed"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect — try again.")
+    with c2:
+        if st.button("Cancel", use_container_width=True):
+            st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2763,6 +2785,10 @@ def main():
         _render_mode_select()
         return
     if _new_game_stage == "resetting":
+        # Password gate — show dialog until confirmed, then proceed
+        if not st.session_state.pop("_reset_confirmed", False):
+            _confirm_reset_dialog()
+            return
         _reset_game_with_loading(db)
         return
     if _new_game_stage == "fetching":

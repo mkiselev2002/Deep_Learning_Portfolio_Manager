@@ -62,3 +62,8 @@ LOOKBACK_DAYS: int = 30                      # minimum history needed
 # ─── Paths ─────────────────────────────────────────────────────────────────
 DB_PATH          = str(_PROJECT_ROOT / "portfolio.db")
 BACKTEST_DB_PATH = str(_PROJECT_ROOT / "backtest.db")
+
+# ─── Security ───────────────────────────────────────────────────────────────
+# Set the RESET_PASSWORD environment variable in Railway (or .env) to protect
+# the "Start New Game" action.  Falls back to a safe default for local dev.
+RESET_PASSWORD: str = os.environ.get("RESET_PASSWORD", "reset123")
