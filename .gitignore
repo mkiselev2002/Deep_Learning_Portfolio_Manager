@@ -1,4 +1,5 @@
 portfolio.db
+backtest.db
 __pycache__/
 *.pyc
 .DS_Store
