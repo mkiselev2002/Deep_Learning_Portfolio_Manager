@@ -337,12 +337,17 @@ def run_single_day(
 # Trade Proposals Dialog
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@st.dialog("📋  Proposed Trades — Confirm to Execute", width="large")
 def show_proposals_dialog(db: "PortfolioDatabase", today_str: str) -> None:
     """
-    Modal dialog that shows the proposed trades for the current simulation day
-    and lets the user confirm or cancel execution.
+    Full-page trade confirmation screen — shown instead of the rest of the app
+    whenever a proposal is pending.  Replaced @st.dialog for reliability.
     """
+    st.markdown(
+        "<h2 style='font-size:1.4rem;font-weight:900;text-transform:uppercase;"
+        "letter-spacing:0.06em;color:#f1f5f9;margin-bottom:0.6rem;'>"
+        "📋 Proposed Trades — Confirm to Execute</h2>",
+        unsafe_allow_html=True,
+    )
     data      = st.session_state["pending_day_data"]
     proposals = data["proposals"]
     analysis  = data["analysis"]
@@ -746,12 +751,20 @@ def _render_vs_sp500(daily_results: list[dict]) -> None:
         marker=dict(size=7, color="#f59e0b"),
         fill="tozeroy", fillcolor="rgba(245,158,11,0.06)",
     ))
+    # SPY: normalise from the first actual simulation date (Day 1), not from the
+    # artificial t0 anchor.  This ensures both lines start at 100 on Day 1.
+    spy_a = pd.Series(dtype=float)
     if not spy_raw.empty:
-        spy_a = spy_raw.reindex(port_ext.index, method="ffill").dropna()
-        if len(spy_a) >= 1:
-            spy_norm = spy_a / spy_a.iloc[0] * 100
+        _spy_days = spy_raw.reindex(pd.DatetimeIndex(dates), method="ffill").dropna()
+        if len(_spy_days) >= 1:
+            _spy_norm = _spy_days / _spy_days.iloc[0] * 100
+            # Prepend t0 at 100 to align with the portfolio's visual anchor
+            spy_a = pd.concat([
+                pd.Series([100.0], index=pd.DatetimeIndex([t0])),
+                _spy_norm,
+            ])
             fig.add_trace(go.Scatter(
-                x=spy_norm.index, y=spy_norm.values,
+                x=spy_a.index, y=spy_a.values,
                 name="S&P 500 (SPY)", mode="lines+markers",
                 line=dict(color="#60a5fa", width=2, dash="dot"),
                 marker=dict(size=5, color="#60a5fa"),
@@ -760,8 +773,8 @@ def _render_vs_sp500(daily_results: list[dict]) -> None:
 
     # Collect all y-values from both traces to compute tight y-axis range
     _all_y = list(port_norm.values)
-    if not spy_raw.empty and len(spy_a) >= 1:
-        _all_y += list(spy_norm.values)
+    if not spy_a.empty:
+        _all_y += list(spy_a.values)
     _y_min = min(_all_y)
     _y_max = max(_all_y)
     _span  = max(_y_max - _y_min, 0.4)   # at least 0.4 index points
@@ -1527,8 +1540,24 @@ def render_market_data(db: PortfolioDatabase, bt_prices_df: "pd.DataFrame | None
             df_bt["open"] = df_bt["close"]
 
         df_bt = df_bt.dropna(subset=["close"])
-        df_bt["name"]   = df_bt["symbol"]   # prices table has no name metadata
-        df_bt["sector"] = "—"
+        # Enrich with name/sector from the simulation DB's sp500_stocks table
+        # (the backtest DB's prices table only stores date/symbol/close)
+        try:
+            _sim_stocks = PortfolioDatabase(DB_PATH).get_sp500_stocks()
+            if not _sim_stocks.empty:
+                _meta = (
+                    _sim_stocks[["symbol", "name", "sector"]]
+                    .drop_duplicates("symbol")
+                )
+                df_bt = df_bt.merge(_meta, on="symbol", how="left")
+                df_bt["name"]   = df_bt["name"].fillna(df_bt["symbol"])
+                df_bt["sector"] = df_bt["sector"].fillna("—")
+            else:
+                df_bt["name"]   = df_bt["symbol"]
+                df_bt["sector"] = "—"
+        except Exception:
+            df_bt["name"]   = df_bt["symbol"]
+            df_bt["sector"] = "—"
 
         price_date = selected_ts.strftime("%Y-%m-%d")
         _render_market_data_table(df_bt, price_date, "S&P 500 Historical Market Data (Backtest)")
@@ -1922,6 +1951,12 @@ def _deal_next_hand(
         sim_date        = pd.Timestamp(backtest_date)
 
     date_str = sim_date.strftime("%Y-%m-%d")
+    # Guard: if sim_date is not in the loaded prices index (e.g. due to NaN-only
+    # rows being skipped during upsert), fall back to the nearest available date.
+    if sim_date not in prices_df_fresh.index:
+        _avail = prices_df_fresh.index[prices_df_fresh.index <= sim_date]
+        sim_date = _avail[-1] if not _avail.empty else prices_df_fresh.index[0]
+        date_str = sim_date.strftime("%Y-%m-%d")
     prices          = prices_df_fresh.loc[sim_date].to_dict()
     portfolio       = db.get_portfolio_state(prices)
 
@@ -2877,9 +2912,11 @@ def main():
 
     today_str = date.today().isoformat()
 
-    # ── Show trade confirmation dialog if a proposal is pending ──────────────
+    # ── Show trade confirmation screen if a proposal is pending ─────────────
+    # Renders inline (full-page) — returns early so nothing else renders.
     if st.session_state.get("pending_day_data") is not None:
         show_proposals_dialog(db, today_str)
+        return
 
     # ── Auto-generate portfolio report (once per day in sim; once per step in bt)
     # Report key changes every backtest step so we re-run after each advance.
