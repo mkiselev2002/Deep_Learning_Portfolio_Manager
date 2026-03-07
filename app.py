@@ -2759,10 +2759,8 @@ def main():
     else:
         already_ran_today = db.get_last_advance_date() == today_str
         _is_weekend       = date.today().weekday() >= 5   # 5=Sat, 6=Sun
-        dates_remaining   = (
-            st.session_state["sim_started"]
-            and st.session_state["sim_date_idx"] < SIMULATION_DAYS
-        )
+        # No day cap — simulation runs indefinitely until the user stops
+        dates_remaining   = st.session_state["sim_started"]
 
     pending_confirm = st.session_state.get("pending_day_data") is not None
     # Day-advancement gate: weekends block advancing to the next trading day,
