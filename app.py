@@ -858,14 +858,15 @@ def _render_vs_sp500(daily_results: list[dict]) -> None:
         ss = ("N/A" if pd.isna(sv)
               else (f"{sv:{fmt}}{suffix}" if spy_key or spy_fixed is not None else "—"))
 
-        # Arrow direction = beating SPY or not
+        # Arrow direction + its own color = beating SPY or not (independent of value sign)
         if not pd.isna(pv) and not pd.isna(sv):
-            win   = pv > sv if higher_better else pv < sv
-            arrow = "▲" if win else "▼"
+            win         = pv > sv if higher_better else pv < sv
+            arrow       = "▲" if win else "▼"
+            arrow_color = "#10b981" if win else "#ef4444"
         else:
-            arrow = ""
+            arrow = arrow_color = ""
 
-        # Color = sign of the portfolio value (negative→red, positive→green, zero→yellow)
+        # Value color = sign of the portfolio value (negative→red, positive→green, zero→yellow)
         if pd.isna(pv):
             color = "#6b7280"
         elif pv > 0:
@@ -883,7 +884,7 @@ def _render_vs_sp500(daily_results: list[dict]) -> None:
             f"letter-spacing:0.1em;margin-bottom:4px;'>{label}</div>"
             f"<div style='font-size:1.05rem;font-weight:900;color:{color};"
             f"font-family:monospace;line-height:1.2;'>"
-            f"{ps} <span style='font-size:0.7rem;'>{arrow}</span></div>"
+            f"{ps} <span style='font-size:0.7rem;color:{arrow_color};'>{arrow}</span></div>"
             f"<div style='font-size:0.65rem;color:#6b7280;margin-top:3px;'>"
             f"SPY&nbsp;<span style='color:#60a5fa;'>{ss}</span></div>"
             f"</div>"
