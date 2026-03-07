@@ -2236,12 +2236,17 @@ def _start_backtest_with_loading(db: "PortfolioDatabase") -> None:
     sim_db = PortfolioDatabase(DB_PATH)
 
     if not sim_db.has_prices():
-        st.markdown(_loading_overlay(
-            "Setting Up Backtest",
-            "Fetching S&P 500 history since 2019 &mdash; this takes about a minute&hellip;",
-        ), unsafe_allow_html=True)
+        # Fetch only the window needed: 90-day lookback before start date + 30 days after.
+        # This avoids loading 7 years of data into memory.
         try:
-            md.fetch_and_store_prices(sim_db, start="2019-01-01")
+            _bt_start_ts   = pd.Timestamp(start_date_str) if start_date_str else pd.Timestamp.now()
+            _fetch_start   = (_bt_start_ts - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
+            _fetch_end_ts  = _bt_start_ts + pd.Timedelta(days=30)
+            st.markdown(_loading_overlay(
+                "Setting Up Backtest",
+                f"Fetching S&P 500 prices from {_fetch_start}&hellip;",
+            ), unsafe_allow_html=True)
+            md.fetch_and_store_prices(sim_db, start=_fetch_start)
             st.cache_data.clear()
         except Exception as exc:
             st.session_state["new_game_stage"]  = "bt_setup"
@@ -2273,8 +2278,22 @@ def _start_backtest_with_loading(db: "PortfolioDatabase") -> None:
         prices_window = sim_db.load_prices(cutoff_date=end_ts)
         if not prices_window.empty:
             prices_window = prices_window[prices_window.index >= buffer_start]
-            db.upsert_prices(prices_window)
 
+        # If sim_db doesn't cover the requested period, fetch just that window
+        if prices_window.empty or prices_window.index.min() > buffer_start + pd.Timedelta(days=10):
+            fetch_start = buffer_start.strftime("%Y-%m-%d")
+            fetch_end   = end_ts.strftime("%Y-%m-%d")
+            st.markdown(_loading_overlay(
+                "Fetching Historical Data",
+                f"Downloading S&P 500 prices for {fetch_start} → {fetch_end}&hellip;",
+            ), unsafe_allow_html=True)
+            md.fetch_and_store_prices(sim_db, start=fetch_start)
+            st.cache_data.clear()
+            prices_window = sim_db.load_prices(cutoff_date=end_ts)
+            if not prices_window.empty:
+                prices_window = prices_window[prices_window.index >= buffer_start]
+
+        db.upsert_prices(prices_window)
         bt_dates = [d for d in prices_window.index if start_ts <= d <= end_ts]
     except Exception as exc:
         st.session_state["new_game_stage"]  = "bt_setup"
@@ -2284,7 +2303,7 @@ def _start_backtest_with_loading(db: "PortfolioDatabase") -> None:
 
     if not bt_dates:
         st.session_state["new_game_stage"]  = "bt_setup"
-        st.session_state["_new_game_error"] = "No trading dates found in the selected range."
+        st.session_state["_new_game_error"] = "No trading dates found in the selected range — try a more recent date."
         st.rerun()
         return
 
