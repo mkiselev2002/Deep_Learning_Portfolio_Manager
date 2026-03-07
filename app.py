@@ -2371,9 +2371,14 @@ header,[data-testid="stToolbar"],[data-testid="stDecoration"]{display:none!impor
         if selected_date != _raw_date:
             st.caption(f"⚠️ Clamped to allowed range: {selected_date}")
 
-        # Pick the first SIMULATION_DAYS trading days from selected start
+        # Pick the first SIMULATION_DAYS trading days from selected start.
+        # Guard: if the earliest available date is >30 calendar days after
+        # the selected start, the cached DB doesn't have data for this window
+        # — treat as empty so the "will be fetched" card is shown instead.
         _start_ts         = pd.Timestamp(selected_date)
         _trading_from_start = sorted([d for d in all_dates if d >= _start_ts])
+        if _trading_from_start and (_trading_from_start[0] - _start_ts).days > 30:
+            _trading_from_start = []
         bt_dates          = _trading_from_start[:SIMULATION_DAYS]
         n_days            = len(bt_dates)
         end_label         = bt_dates[-1].strftime("%b %d, %Y") if bt_dates else (
