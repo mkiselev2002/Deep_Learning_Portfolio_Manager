@@ -2728,25 +2728,46 @@ def _start_new_game_with_loading(db: "PortfolioDatabase") -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Reset-guard dialog
+# Reset-guard screen
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@st.dialog("🔐 Confirm Reset")
-def _confirm_reset_dialog() -> None:
-    """Password-protected gate for 'Start New Game'."""
-    st.warning("⚠️ This will permanently wipe all portfolio data and start fresh.")
-    pwd = st.text_input("Enter the secret word to continue:", type="password")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("✅  Confirm", type="primary", use_container_width=True):
-            if pwd == config.RESET_PASSWORD:
-                st.session_state["_reset_confirmed"] = True
+def _confirm_reset_screen() -> None:
+    """Full-page password gate — shown instead of the modal dialog for reliability."""
+    _, col, _ = st.columns([1, 2, 1])
+    with col:
+        st.markdown(
+            """
+            <div style="text-align:center; padding:3rem 0 1.5rem;">
+              <div style="font-size:3rem; margin-bottom:0.75rem;">🔐</div>
+              <div style="font-size:1.25rem; font-weight:900; color:#f1f5f9;
+                          text-transform:uppercase; letter-spacing:0.06em;
+                          margin-bottom:0.5rem;">Confirm Reset</div>
+              <div style="color:#9ca3af; font-size:0.85rem;
+                          margin-bottom:1.25rem;">
+                Enter the secret word to wipe all portfolio data and start fresh.
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        pwd = st.text_input(
+            "Secret word",
+            type="password",
+            placeholder="Enter secret word…",
+            label_visibility="collapsed",
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("✅  Confirm", type="primary", use_container_width=True):
+                if pwd == config.RESET_PASSWORD:
+                    st.session_state["_reset_confirmed"] = True
+                    st.rerun()
+                else:
+                    st.error("❌  Incorrect — try again.")
+        with c2:
+            if st.button("Cancel", use_container_width=True):
+                st.session_state["new_game_stage"] = "mode_select"
                 st.rerun()
-            else:
-                st.error("Incorrect — try again.")
-    with c2:
-        if st.button("Cancel", use_container_width=True):
-            st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2785,9 +2806,9 @@ def main():
         _render_mode_select()
         return
     if _new_game_stage == "resetting":
-        # Password gate — show dialog until confirmed, then proceed
+        # Password gate — show full-page screen until confirmed, then proceed
         if not st.session_state.pop("_reset_confirmed", False):
-            _confirm_reset_dialog()
+            _confirm_reset_screen()
             return
         _reset_game_with_loading(db)
         return
