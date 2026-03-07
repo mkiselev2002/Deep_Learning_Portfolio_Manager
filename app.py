@@ -9,8 +9,8 @@ Run:
 
 import logging
 import random
+import time
 from datetime import date, datetime
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -22,7 +22,8 @@ from agents import DataAgent, StrategyAgent, RiskAgent, ExecutionAgent
 logger = logging.getLogger(__name__)
 from config import (
     API_KEY,
-    CSV_PATH,
+    BACKTEST_DB_PATH,
+    DB_PATH,
     INITIAL_CAPITAL,
     LOOKBACK_DAYS,
     MAX_POSITION_PCT,
@@ -116,7 +117,62 @@ hr { border-color: rgba(245,158,11,0.18) !important; }
     background: rgba(255,255,255,0.025) !important;
     border: 1px solid rgba(245,158,11,0.22) !important;
     border-radius: 12px !important;
-    padding: 0.2rem 0.4rem !important;
+    padding: 0.65rem 0.8rem !important;
+}
+
+/* ── Equal-height side-by-side bordered cards ── */
+[data-testid="stHorizontalBlock"]:has([data-testid="stVerticalBlockBorderWrapper"]) {
+    align-items: stretch !important;
+}
+[data-testid="stHorizontalBlock"]:has([data-testid="stVerticalBlockBorderWrapper"]) > [data-testid="stColumn"] > [data-testid="stVerticalBlock"] {
+    height: 100% !important;
+}
+[data-testid="stHorizontalBlock"]:has([data-testid="stVerticalBlockBorderWrapper"]) > [data-testid="stColumn"] > [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlockBorderWrapper"] {
+    height: 100% !important;
+}
+
+/* ── Hide Streamlit heading anchor links ── */
+[data-testid="stHeadingAnchorLink"],
+h1 a, h2 a, h3 a { display: none !important; }
+
+/* ── Reduce gap between control strip cards and tabs ── */
+.ctrl-bottom-border { margin: 0 !important; }
+[data-testid="stTabs"] { margin-top: 0.25rem !important; }
+
+/* ── st.metric styling — matches _html_metric look ── */
+[data-testid="stMetric"] { text-align: center !important; }
+[data-testid="stMetricLabel"] span {
+    font-size: 0.65rem !important; font-weight: 800 !important;
+    text-transform: uppercase !important; letter-spacing: 0.14em !important;
+    color: #f59e0b !important;
+}
+[data-testid="stMetricValue"] {
+    font-family: "Courier New", monospace !important;
+    font-size: 1.65rem !important; font-weight: 900 !important; color: #f1f5f9 !important;
+}
+[data-testid="stMetricLabel"] [data-testid="stTooltipHoverTarget"] svg { color: #9ca3af !important; }
+
+/* ── Casino easter egg — popover looks like a plain emoji, not a button ── */
+[data-testid="stPopover"] button {
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 0.15rem !important;
+    min-height: unset !important;
+    line-height: 1 !important;
+    color: inherit !important;
+}
+[data-testid="stPopover"] button:hover,
+[data-testid="stPopover"] button:focus {
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+}
+[data-testid="stPopover"] button svg { display: none !important; }
+[data-testid="stPopover"] button p {
+    font-size: 1.8rem !important;
+    line-height: 1 !important;
+    margin: 0 !important;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -157,15 +213,19 @@ def _html_metric(label: str, value: str, delta: str | None = None,
             f"margin-left:0.5rem; white-space:nowrap;'>{delta}</span>"
         )
 
+    label_html = (
+        f"<div style='font-size:0.62rem; font-weight:700; text-transform:uppercase; "
+        f"letter-spacing:0.13em; color:#6b7280; margin-top:0.3rem;'>{label}</div>"
+    ) if label else ""
+
     return (
-        f"<div style='padding:0.55rem 0.1rem;'>"
-        f"<div style='font-size:0.65rem; font-weight:800; text-transform:uppercase; "
-        f"letter-spacing:0.14em; color:#f59e0b; margin-bottom:0.25rem;'>{label}</div>"
-        f"<div style='display:flex; align-items:baseline; flex-wrap:wrap; gap:0;'>"
+        f"<div style='padding:0.55rem 0.1rem; text-align:center;'>"
+        f"<div style='display:flex; align-items:baseline; flex-wrap:wrap; gap:0; justify-content:center;'>"
         f"<span style='font-family:\"Courier New\",monospace; font-size:1.65rem; "
         f"font-weight:900; color:#f1f5f9; line-height:1;'>{value}</span>"
         f"{delta_html}"
         f"</div>"
+        f"{label_html}"
         f"</div>"
     )
 
@@ -175,10 +235,63 @@ def _html_metric(label: str, value: str, delta: str | None = None,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(show_spinner="Loading price data …")
-def load_price_data() -> pd.DataFrame:
-    df = pd.read_csv(CSV_PATH, index_col=0, parse_dates=True)
-    df.index = pd.to_datetime(df.index)
-    return df.sort_index()
+def load_price_data(db_path: str) -> pd.DataFrame:
+    """Load wide-format price history from the prices table of the given DB."""
+    return PortfolioDatabase(db_path).load_prices()
+
+
+def _sync_sim_prices(sim_db: "PortfolioDatabase") -> "pd.DataFrame":
+    """
+    Ensure sim_db (portfolio.db) has an up-to-date price history without
+    downloading everything from scratch on every new game.
+
+    Priority:
+      1. sim_db already current      → incremental top-up only (seconds)
+      2. sim_db empty, backtest_db has data → copy + incremental top-up
+      3. Both empty                  → full yfinance fetch from 2019 (one-time)
+
+    Returns the full prices DataFrame stored in sim_db.
+    """
+    from datetime import timedelta as _td
+    _, sim_max = sim_db.get_prices_date_range()
+    today = date.today()
+
+    if sim_max is not None:
+        # Prices exist — just refresh any missing recent trading days
+        if sim_max.date() < today - _td(days=1):
+            return md.refresh_latest_prices(sim_db)
+        return sim_db.load_prices()
+
+    # sim_db is empty — try to seed it from the backtest DB first
+    bt_db = PortfolioDatabase(BACKTEST_DB_PATH)
+    if bt_db.has_prices():
+        bt_prices = bt_db.load_prices()
+        if not bt_prices.empty:
+            logger.info(
+                "_sync_sim_prices: seeding sim DB from backtest DB "
+                "(%d rows, %d tickers).",
+                len(bt_prices) * len(bt_prices.columns),
+                len(bt_prices.columns),
+            )
+            sim_db.upsert_prices(bt_prices)
+            # Top-up with any dates newer than what the backtest DB had
+            return md.refresh_latest_prices(sim_db)
+
+    # Nothing anywhere — full historical fetch (only happens once ever)
+    logger.info("_sync_sim_prices: no cached prices found — fetching from 2019.")
+    return md.fetch_and_store_prices(sim_db, start="2019-01-01")
+
+
+def _ensure_price_history() -> None:
+    """
+    Called during the loading screen on every server start.
+    Uses _sync_sim_prices() so we never re-download data we already have.
+    """
+    sim_db = PortfolioDatabase(DB_PATH)
+    try:
+        _sync_sim_prices(sim_db)
+    except Exception as exc:
+        logger.warning("Price history sync failed: %s", exc)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -249,6 +362,30 @@ def show_proposals_dialog(db: "PortfolioDatabase", today_str: str) -> None:
     elif API_KEY:
         st.success("Trades proposed by Claude AI", icon="🤖")
 
+    # ── Pre-validation risk summary ───────────────────────────────────────────
+    risk_violations = data.get("risk_violations", [])
+    if risk_violations:
+        rejected = [v for v in risk_violations if v.startswith("REJECTED")]
+        trimmed  = [v for v in risk_violations if v.startswith("TRIMMED")]
+        if rejected:
+            st.warning(
+                f"**Risk Agent:** {len(rejected)} trade(s) rejected after {3} attempt(s). "
+                "Showing best revised proposal.",
+                icon="⚠️",
+            )
+        elif trimmed:
+            st.info(
+                f"**Risk Agent:** {len(trimmed)} trade(s) trimmed to stay within limits.",
+                icon="✂️",
+            )
+        with st.expander(f"Risk Agent output ({len(risk_violations)} note(s))", expanded=False):
+            for v in risk_violations:
+                color = "#fca5a5" if v.startswith("REJECTED") else "#fde68a"
+                st.markdown(
+                    f"<div style='font-size:0.8rem; color:{color}; padding:2px 0;'>• {v}</div>",
+                    unsafe_allow_html=True,
+                )
+
     st.markdown(
         f"**Day {day_num}  ·  Market date: {date_str}**  "
         f"— Portfolio value: **${total_val:,.0f}**",
@@ -282,20 +419,29 @@ def show_proposals_dialog(db: "PortfolioDatabase", today_str: str) -> None:
 
     # ── New buys block ────────────────────────────────────────────────────────
     if buys:
-        st.markdown("#### 🟢  New positions (equal-weight, 20% each)")
+        import math as _math
+        n_picks      = len(buys)
+        alloc_pct    = round(100 / n_picks)
+        # Mirror the risk-agent logic: equal split of (cash_after_sells × 0.995)
+        # For display we approximate: total_val × 0.995 / n_picks
+        per_stock_amt = total_val * 0.995 / n_picks
+        st.markdown(f"#### 🟢  New positions (equal-weight, {alloc_pct}% each)")
         buy_rows = []
         for p in buys:
             m     = analysis.get(p["ticker"], {})
             price = m.get("price", 0.0)
             vol   = m.get("realized_vol_5d", 0.0)
             chg   = m.get("prev_day_return", 0.0)
-            amt   = total_val * 0.20
+            # Whole shares the execution agent will actually buy
+            est_shares = _math.floor(per_stock_amt / price) if price > 0 else 0
+            est_amt    = est_shares * price
             buy_rows.append({
                 "Ticker":             p["ticker"],
                 "Price":              f"${price:,.2f}",
                 "5d Realised Vol":    f"{vol:.1%}",
                 "Prev Day Change":    f"{chg:+.2f}%",
-                "Amount to Invest":   f"${amt:,.0f}",
+                "Est. Shares":        est_shares,
+                "Amount to Invest":   f"${est_amt:,.0f}",
             })
         st.dataframe(
             buy_rows,
@@ -304,8 +450,9 @@ def show_proposals_dialog(db: "PortfolioDatabase", today_str: str) -> None:
         )
 
         st.caption(
-            "Strategy: Top-50 S&P 500 stocks by 5-day realised volatility, "
-            "then the 5 with the largest previous-day loss."
+            f"Strategy: Top-50 S&P 500 stocks by 5-day realised volatility, "
+            f"then the {n_picks} with the largest previous-day loss. "
+            f"Each receives ~{alloc_pct}% of portfolio (${per_stock_amt:,.0f})."
         )
     else:
         st.warning("No buy candidates found in analysis data.", icon="⚠️")
@@ -322,7 +469,7 @@ def show_proposals_dialog(db: "PortfolioDatabase", today_str: str) -> None:
     with col_confirm:
         if st.button("✅  Execute Trades", type="primary", use_container_width=True):
             prices    = data["prices"]
-            prices_df = load_price_data()
+            prices_df = load_price_data(db.db_path)
 
             risk_agent      = RiskAgent()
             portfolio_fresh = db.get_portfolio_state(prices)
@@ -342,8 +489,27 @@ def show_proposals_dialog(db: "PortfolioDatabase", today_str: str) -> None:
                 "llm_reasoning":   data["reasoning"],
             }
 
+            _log_agent({
+                "day":     day_num,
+                "date":    date_str,
+                "agent":   "Execution Agent",
+                "event":   "EXECUTE",
+                "message": (
+                    f"User confirmed. Executed {len(exec_report['executed_trades'])} trade(s). "
+                    f"Portfolio: ${exec_report['equity']:,.0f}"
+                ),
+                "trades": [
+                    {"ticker": t["ticker"], "action": t["action"],
+                     "pct": t.get("pct_of_portfolio", 0),
+                     "reasoning": t.get("reasoning", "")}
+                    for t in exec_report["executed_trades"]
+                ],
+            })
+
             db.save_day_result(result)
-            db.set_last_advance_date(today_str)
+            # Only gate on real calendar date in simulation mode
+            if not data.get("backtest_date"):
+                db.set_last_advance_date(today_str)
             st.session_state["daily_results"].append(result)
             st.session_state["sim_date_idx"] += 1
             st.session_state["sim_day_num"]  += 1
@@ -353,6 +519,13 @@ def show_proposals_dialog(db: "PortfolioDatabase", today_str: str) -> None:
 
     with col_cancel:
         if st.button("❌  Cancel", use_container_width=True):
+            _log_agent({
+                "day":     day_num,
+                "date":    date_str,
+                "agent":   "User",
+                "event":   "CANCEL",
+                "message": "User cancelled the trade proposals — no trades executed.",
+            })
             st.session_state["pending_day_data"] = None
             st.rerun()
 
@@ -365,6 +538,13 @@ _DARK = "plotly_dark"
 
 
 def chart_equity_curve(history: pd.DataFrame, initial_capital: float) -> go.Figure:
+    y_vals = history["total_equity"].tolist()
+    y_min  = min(min(y_vals), initial_capital)
+    y_max  = max(max(y_vals), initial_capital)
+    span   = max(y_max - y_min, y_max * 0.004)   # at least 0.4 % of portfolio
+    y_lo   = y_min - span * 0.35
+    y_hi   = y_max + span * 0.35
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=history["date"], y=history["total_equity"],
@@ -389,6 +569,7 @@ def chart_equity_curve(history: pd.DataFrame, initial_capital: float) -> go.Figu
         height=360, margin=dict(t=50, b=30),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
+        yaxis=dict(range=[y_lo, y_hi]),
     )
     return fig
 
@@ -575,10 +756,22 @@ def _render_vs_sp500(daily_results: list[dict]) -> None:
                 marker=dict(size=5, color="#60a5fa"),
             ))
     fig.add_hline(y=100, line_dash="dash", line_color="rgba(107,114,128,0.35)")
+
+    # Collect all y-values from both traces to compute tight y-axis range
+    _all_y = list(port_norm.values)
+    if not spy_raw.empty and len(spy_a) >= 1:
+        _all_y += list(spy_norm.values)
+    _y_min = min(_all_y)
+    _y_max = max(_all_y)
+    _span  = max(_y_max - _y_min, 0.4)   # at least 0.4 index points
+    _y_lo  = _y_min - _span * 0.35
+    _y_hi  = _y_max + _span * 0.35
+
     fig.update_layout(
         template=_DARK, height=190,
         margin=dict(l=0, r=0, t=6, b=0),
-        yaxis=dict(title="Indexed (100 = start)", tickformat=".2f"),
+        yaxis=dict(title="Indexed (100 = start)", tickformat=".2f",
+                   range=[_y_lo, _y_hi]),
         xaxis=dict(showgrid=False),
         legend=dict(orientation="h", y=1.2, x=0, font=dict(size=10)),
         hovermode="x unified",
@@ -611,13 +804,22 @@ def _render_vs_sp500(daily_results: list[dict]) -> None:
         ss = ("N/A" if pd.isna(sv)
               else (f"{sv:{fmt}}{suffix}" if spy_key or spy_fixed is not None else "—"))
 
+        # Arrow direction = beating SPY or not
         if not pd.isna(pv) and not pd.isna(sv):
             win   = pv > sv if higher_better else pv < sv
-            color = "#10b981" if win else "#ef4444"
             arrow = "▲" if win else "▼"
         else:
-            color = "#f59e0b" if not pd.isna(pv) else "#6b7280"
             arrow = ""
+
+        # Color = sign of the portfolio value (negative→red, positive→green, zero→yellow)
+        if pd.isna(pv):
+            color = "#6b7280"
+        elif pv > 0:
+            color = "#10b981"
+        elif pv < 0:
+            color = "#ef4444"
+        else:
+            color = "#f59e0b"
 
         return (
             f"<div style='background:rgba(255,255,255,0.03);"
@@ -681,18 +883,18 @@ def render_daily_summary(daily_results: list[dict], strategy_lbl: str, portfolio
     if not daily_results:
         st.markdown(
             f"""
-            <div style='text-align:center; padding: 4rem 2rem;'>
-                <div style='font-size:4rem; margin-bottom:1rem;'>🎰</div>
+            <div style='text-align:center; padding: 1.2rem 2rem 1rem;'>
+                <div style='font-size:3.2rem; margin-bottom:0.6rem;'>🎰</div>
                 <div style='font-size:0.72rem; font-weight:800; text-transform:uppercase;
-                            letter-spacing:0.16em; color:#f59e0b; margin-bottom:0.5rem;'>
+                            letter-spacing:0.16em; color:#f59e0b; margin-bottom:0.4rem;'>
                     Welcome to The Trading Floor
                 </div>
                 <div style='font-size:2.4rem; font-weight:900; font-family:monospace;
-                            color:#f1f5f9; margin-bottom:0.4rem;'>
+                            color:#f1f5f9; margin-bottom:0.35rem;'>
                     ${INITIAL_CAPITAL:,.0f}
                 </div>
-                <div style='font-size:0.95rem; color:#6b7280; max-width:420px;
-                            margin:0 auto; line-height:1.6;'>
+                <div style='font-size:0.9rem; color:#6b7280; max-width:420px;
+                            margin:0 auto; line-height:1.5;'>
                     Your starting bankroll is ready.<br>
                     Hit <strong style='color:#f59e0b;'>START NEW GAME</strong>
                     in the sidebar, then
@@ -710,18 +912,14 @@ def render_daily_summary(daily_results: list[dict], strategy_lbl: str, portfolio
     init_cap = st.session_state["sim_capital"]
 
     # ── Header: 4 KPI metrics ─────────────────────────────────────────────────
-    prev_val      = daily_results[-2]["portfolio"]["total_value"] if len(daily_results) > 1 else init_cap
-    today_pnl     = snap["total_value"] - prev_val
-    today_pnl_pct = (today_pnl / prev_val * 100) if prev_val > 0 else 0.0
+    if len(daily_results) == 1:
+        today_pnl, today_pnl_pct = 0.0, 0.0
+    else:
+        prev_val      = daily_results[-2]["portfolio"]["total_value"]
+        today_pnl     = snap["total_value"] - prev_val
+        today_pnl_pct = (today_pnl / prev_val * 100) if prev_val > 0 else 0.0
 
-    st.markdown(
-        f"<div style='font-size:0.65rem; font-weight:800; text-transform:uppercase; "
-        f"letter-spacing:0.14em; color:#f59e0b; margin-bottom:0.6rem;'>"
-        f"📅 Day {day['day_num']}  ·  {day['date']}</div>",
-        unsafe_allow_html=True,
-    )
-
-    # ── Header KPI row (inline deltas via custom HTML) ────────────────────────
+    # ── Header KPI row — no labels, centered numbers ─────────────────────────
     h1, h2, h3, h4 = st.columns(4)
 
     with h1:
@@ -734,7 +932,8 @@ def render_daily_summary(daily_results: list[dict], strategy_lbl: str, portfolio
         st.markdown(_html_metric("Cash", f"${snap['cash']:,.0f}"),
                     unsafe_allow_html=True)
     with h4:
-        _pos = True if today_pnl > 0 else (False if today_pnl < 0 else None)
+        _today_rounded = round(today_pnl)
+        _pos = True if _today_rounded > 0 else (False if _today_rounded < 0 else None)
         st.markdown(
             _html_metric("Today's Return", f"{today_pnl_pct:+.2f}%",
                          delta=f"${today_pnl:+,.0f}", delta_positive=_pos),
@@ -756,7 +955,11 @@ def render_daily_summary(daily_results: list[dict], strategy_lbl: str, portfolio
             st.markdown(f"<div style='{_HDR}'>📰 AI Market Summary</div>",
                         unsafe_allow_html=True)
             if portfolio_report and portfolio_report.get("summary"):
-                st.markdown(portfolio_report["summary"])
+                # Escape bare $ signs so Streamlit never treats them as LaTeX
+                # math delimiters (e.g. "$248,749 … $248k" renders as italic
+                # math mode without this).  \$ is displayed as a plain $.
+                _safe_summary = portfolio_report["summary"].replace("$", r"\$")
+                st.markdown(_safe_summary)
             else:
                 st.caption("No AI summary yet — run a simulation day to generate one.")
 
@@ -796,10 +999,6 @@ def render_daily_summary(daily_results: list[dict], strategy_lbl: str, portfolio
                 )
                 for v in day["violations"]:
                     st.warning(v, icon="⚠️")
-
-            if day.get("llm_reasoning"):
-                with st.expander("Raw LLM output"):
-                    st.code(day["llm_reasoning"], language="json")
 
     st.divider()
 
@@ -847,22 +1046,27 @@ def render_portfolio(
             st.markdown(_html_metric("Portfolio Value", f"${r['portfolio_value']:,.0f}"),
                         unsafe_allow_html=True)
         with h2:
-            _pos2 = True if r['fiveday_pnl'] > 0 else (False if r['fiveday_pnl'] < 0 else None)
+            _r2 = round(r['fiveday_pnl'])
+            _pos2 = True if _r2 > 0 else (False if _r2 < 0 else None)
             st.markdown(
                 _html_metric("5-Day P/L", f"{r['fiveday_pnl_pct']:+.2f}%",
                              delta=f"${r['fiveday_pnl']:+,.0f}", delta_positive=_pos2),
                 unsafe_allow_html=True,
             )
         with h3:
-            _pos3 = True if r['alltime_pnl'] > 0 else (False if r['alltime_pnl'] < 0 else None)
+            _r3 = round(r['alltime_pnl'])
+            _pos3 = True if _r3 > 0 else (False if _r3 < 0 else None)
             st.markdown(
                 _html_metric("All-Time P/L", f"{r['alltime_pnl_pct']:+.2f}%",
                              delta=f"${r['alltime_pnl']:+,.0f}", delta_positive=_pos3),
                 unsafe_allow_html=True,
             )
         with h4:
-            st.markdown(_html_metric("Win Rate", f"{r['win_rate']:.0f}%"),
-                        unsafe_allow_html=True)
+            st.metric(
+                label="Win Rate",
+                value=f"{r['win_rate']:.0f}%",
+                help="% of trading days the portfolio closed higher than the previous day.",
+            )
     else:
         st.markdown(_html_metric("Portfolio Value", f"${snap['total_value']:,.0f}"),
                     unsafe_allow_html=True)
@@ -872,6 +1076,9 @@ def render_portfolio(
     # ── USD Portfolio Value graph (equity curve) ──────────────────────────────
     history_df = db.get_portfolio_history()
     if not history_df.empty:
+        if daily_results:
+            sim_start = daily_results[0]["date"]
+            history_df = history_df[history_df["date"] >= sim_start]
         st.plotly_chart(
             chart_equity_curve(history_df, initial_capital),
             use_container_width=True,
@@ -1190,51 +1397,27 @@ def render_performance(db: PortfolioDatabase, initial_capital: float, daily_resu
     )
 
 
-def render_market_data(db: PortfolioDatabase):
-    st.markdown(
-        "<div style='font-size:0.72rem; font-weight:800; text-transform:uppercase; "
-        "letter-spacing:0.12em; color:#f59e0b; margin-bottom:0.75rem;'>"
-        "S&P 500 Live Market Data</div>",
-        unsafe_allow_html=True,
-    )
-    st.caption("Fetches all S&P 500 constituents with latest OHLCV via yfinance. Cached in local DB.")
-
-    fetch_dates = db.get_sp500_fetch_dates()
-
-    if not fetch_dates:
-        st.info("No data yet — press **Fetch / Refresh** below to download today's quotes.")
-        if st.button("🔄  Fetch / Refresh", type="primary", use_container_width=True):
-            with st.spinner("Pulling quotes from Yahoo Finance …"):
-                try:
-                    md.fetch_and_store_sp500(db)
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Failed: {exc}")
-        return
-
-    selected_date = st.selectbox(
-        "Snapshot", options=fetch_dates, index=0, label_visibility="collapsed"
-    )
-
-    df = db.get_sp500_stocks(selected_date)
-    if df.empty:
-        st.warning("No data for this date.")
-        return
-
-    df["change_pct"] = ((df["close"] - df["open"]) / df["open"] * 100).round(2)
+def _render_market_data_table(df: pd.DataFrame, price_date: str, mode_label: str) -> None:
+    """Shared table renderer used by both simulation and backtest market data views."""
+    df = df.copy()
+    if "change_pct" not in df.columns:
+        if "open" in df.columns and "close" in df.columns:
+            df["change_pct"] = ((df["close"] - df["open"]) / df["open"] * 100).round(2)
+        else:
+            df["change_pct"] = float("nan")
 
     total   = len(df)
     gainers = int((df["change_pct"] > 0).sum())
     losers  = int((df["change_pct"] < 0).sum())
 
-    # Derive the actual market date of the price data (may lag fetch_date on weekends)
-    price_date = selected_date  # fallback
-    if "price_date" in df.columns:
-        _pd_vals = df["price_date"].dropna()
-        if not _pd_vals.empty:
-            price_date = str(_pd_vals.iloc[0])
+    st.markdown(
+        f"<div style='font-size:0.72rem; font-weight:800; text-transform:uppercase; "
+        f"letter-spacing:0.12em; color:#f59e0b; margin-bottom:0.3rem;'>"
+        f"{mode_label}</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(f"As per Yahoo Finance on {price_date}")
 
-    # ── Summary metrics (no delta badges) ─────────────────────────────────────
     m1, m2, m3, m4 = st.columns(4)
     with m1:
         st.markdown(_html_metric("Stocks",      str(total)),   unsafe_allow_html=True)
@@ -1245,20 +1428,13 @@ def render_market_data(db: PortfolioDatabase):
     with m4:
         st.markdown(_html_metric("Market Date", price_date),   unsafe_allow_html=True)
 
-    if price_date != selected_date:
-        st.caption(
-            f"ℹ️  Prices quoted as of **{price_date}** (last trading day) — "
-            f"fetched on {selected_date}."
-        )
-
     st.divider()
 
-    # ── Filters ───────────────────────────────────────────────────────────────
     fc1, fc2, fc3 = st.columns([2, 1, 1])
     with fc1:
         search = st.text_input("Search ticker or company", placeholder="e.g. AAPL or Apple")
     with fc2:
-        sectors = ["All Sectors"] + sorted(df["sector"].dropna().unique().tolist())
+        sectors = ["All Sectors"] + sorted(df["sector"].dropna().unique().tolist()) if "sector" in df.columns else ["All Sectors"]
         sector_filter = st.selectbox("Sector", sectors)
     with fc3:
         direction = st.selectbox("Direction", ["All", "Winners only", "Losers only"])
@@ -1266,11 +1442,10 @@ def render_market_data(db: PortfolioDatabase):
     filtered = df.copy()
     if search:
         q = search.upper()
-        filtered = filtered[
-            filtered["symbol"].str.upper().str.contains(q, na=False)
-            | filtered["name"].str.upper().str.contains(q, na=False)
-        ]
-    if sector_filter != "All Sectors":
+        sym_match  = filtered["symbol"].str.upper().str.contains(q, na=False) if "symbol" in filtered.columns else pd.Series(False, index=filtered.index)
+        name_match = filtered["name"].str.upper().str.contains(q, na=False)   if "name"   in filtered.columns else pd.Series(False, index=filtered.index)
+        filtered = filtered[sym_match | name_match]
+    if sector_filter != "All Sectors" and "sector" in filtered.columns:
         filtered = filtered[filtered["sector"] == sector_filter]
     if direction == "Winners only":
         filtered = filtered[filtered["change_pct"] > 0]
@@ -1279,40 +1454,287 @@ def render_market_data(db: PortfolioDatabase):
 
     st.caption(f"Showing {len(filtered)} of {total} stocks")
 
-    display = filtered[["symbol", "name", "sector", "open", "high", "low",
-                         "close", "change_pct", "volume"]].copy()
-    display.columns = ["Symbol", "Company", "Sector", "Open", "High", "Low",
-                        "Close", "Change %", "Volume"]
+    show_cols = [c for c in ["symbol", "name", "sector", "open", "high", "low", "close", "change_pct", "volume"] if c in filtered.columns]
+    display = filtered[show_cols].copy()
+    col_map = {"symbol": "Symbol", "name": "Company", "sector": "Sector",
+                "open": "Open", "high": "High", "low": "Low",
+                "close": "Close", "change_pct": "Change %", "volume": "Volume"}
+    display.columns = [col_map.get(c, c) for c in show_cols]
 
     def _style_change(val):
         if pd.isna(val):
             return ""
         return "color:#10b981; font-weight:700" if val > 0 else "color:#ef4444; font-weight:700"
 
+    fmt = {}
+    for col in ["Open", "High", "Low", "Close"]:
+        if col in display.columns:
+            fmt[col] = lambda v: f"${v:.2f}" if pd.notna(v) else "—"
+    if "Change %" in display.columns:
+        fmt["Change %"] = lambda v: f"{v:+.2f}%" if pd.notna(v) else "—"
+    if "Volume" in display.columns:
+        fmt["Volume"] = lambda v: f"{int(v):,}" if pd.notna(v) else "—"
+
+    styled = display.style
+    if "Change %" in display.columns:
+        styled = styled.map(_style_change, subset=["Change %"])
     st.dataframe(
-        display.style
-        .map(_style_change, subset=["Change %"])
-        .format({
-            "Open":     lambda v: f"${v:.2f}" if pd.notna(v) else "—",
-            "High":     lambda v: f"${v:.2f}" if pd.notna(v) else "—",
-            "Low":      lambda v: f"${v:.2f}" if pd.notna(v) else "—",
-            "Close":    lambda v: f"${v:.2f}" if pd.notna(v) else "—",
-            "Change %": lambda v: f"{v:+.2f}%" if pd.notna(v) else "—",
-            "Volume":   lambda v: f"{int(v):,}" if pd.notna(v) else "—",
-        }),
+        styled.format(fmt),
         hide_index=True, use_container_width=True, height=600,
     )
 
-    st.divider()
 
-    # ── Fetch / Refresh button at the bottom ──────────────────────────────────
-    if st.button("🔄  Fetch / Refresh Market Data", type="primary", use_container_width=True):
-        with st.spinner("Pulling quotes from Yahoo Finance …"):
+def render_market_data(db: PortfolioDatabase, bt_prices_df: "pd.DataFrame | None" = None,
+                       bt_cutoff_date: "pd.Timestamp | None" = None) -> None:
+    """
+    Renders the Market Data tab.
+
+    In simulation mode (bt_prices_df=None) data comes from the DB (sp500_stocks table).
+    In backtest mode, bt_prices_df is the backtest DB's prices DataFrame filtered to
+    dates <= bt_cutoff_date; we build a day-by-day selector from those trading days.
+    """
+    if bt_prices_df is not None and bt_cutoff_date is not None:
+        # ── Backtest mode: build view from DB close prices ─────────────────────
+        bt_dates_done = bt_prices_df.index[bt_prices_df.index <= bt_cutoff_date]
+        if bt_dates_done.empty:
+            st.info("No backtest market data yet — advance at least one day.")
+            return
+
+        sorted_dates = sorted(bt_dates_done, reverse=True)
+        day_labels   = [f"Trading Day {i + 1}" for i in range(len(sorted_dates) - 1, -1, -1)]
+        label_to_ts  = dict(zip(day_labels, sorted_dates))
+
+        selected_label = st.selectbox(
+            "Snapshot", options=day_labels, index=0, label_visibility="collapsed"
+        )
+        selected_ts = label_to_ts[selected_label]
+
+        # Build a DataFrame of close prices for the selected day
+        close_row = bt_prices_df.loc[selected_ts]
+        df_bt = pd.DataFrame({
+            "symbol": close_row.index,
+            "close":  close_row.values,
+        })
+        # Compute 1-day change if previous day exists
+        prev_dates = bt_prices_df.index[bt_prices_df.index < selected_ts]
+        if not prev_dates.empty:
+            prev_ts   = prev_dates[-1]
+            prev_row  = bt_prices_df.loc[prev_ts]
+            aligned   = prev_row.reindex(df_bt["symbol"])
+            df_bt["open"] = aligned.values
+        else:
+            df_bt["open"] = df_bt["close"]
+
+        df_bt = df_bt.dropna(subset=["close"])
+        df_bt["name"]   = df_bt["symbol"]   # prices table has no name metadata
+        df_bt["sector"] = "—"
+
+        price_date = selected_ts.strftime("%Y-%m-%d")
+        _render_market_data_table(df_bt, price_date, "S&P 500 Historical Market Data (Backtest)")
+        return
+
+    # ── Simulation mode: read from DB ─────────────────────────────────────────
+    fetch_dates = db.get_sp500_fetch_dates()
+
+    if not fetch_dates:
+        st.info("No market data yet — start a new game to fetch today's quotes.")
+        return
+
+    # Build "Trading Day N" labels (most recent = highest day number)
+    day_labels = [f"Trading Day {len(fetch_dates) - i}" for i in range(len(fetch_dates))]
+    label_to_date = dict(zip(day_labels, fetch_dates))
+
+    selected_label = st.selectbox(
+        "Snapshot", options=day_labels, index=0, label_visibility="collapsed"
+    )
+    selected_date = label_to_date[selected_label]
+
+    df = db.get_sp500_stocks(selected_date)
+    if df.empty:
+        st.warning("No data for this date.")
+        return
+
+    # Derive the actual market date of the price data
+    price_date = selected_date
+    if "price_date" in df.columns:
+        _pd_vals = df["price_date"].dropna()
+        if not _pd_vals.empty:
+            price_date = str(_pd_vals.iloc[0])
+
+    _render_market_data_table(df, price_date, "S&P 500 Live Market Data")
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Agent Logs tab renderer
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_AGENT_COLORS = {
+    "Data Agent":      ("#3b82f6", "#1e3a5f"),
+    "Strategy Agent":  ("#f59e0b", "#3d2e08"),
+    "Risk Agent":      ("#ef4444", "#3d1515"),
+    "Execution Agent": ("#10b981", "#0a2e21"),
+    "User":            ("#8b5cf6", "#2a1f4a"),
+}
+_EVENT_BADGES = {
+    "ANALYZE":  ("#3b82f6",  "ANALYZE"),
+    "PROPOSE":  ("#f59e0b",  "PROPOSE"),
+    "REVISE":   ("#f97316",  "REVISE"),
+    "REJECT":   ("#ef4444",  "REJECT"),
+    "APPROVE":  ("#10b981",  "APPROVE"),
+    "EXECUTE":  ("#10b981",  "EXECUTE"),
+    "CANCEL":   ("#6b7280",  "CANCEL"),
+}
+
+
+def render_agent_logs() -> None:
+    """Render the agent pipeline log — table view + timeline view."""
+    logs: list[dict] = st.session_state.get("agent_logs", [])
+
+    st.markdown(
+        "<div style='font-size:0.65rem; font-weight:800; text-transform:uppercase; "
+        "letter-spacing:0.12em; color:#f59e0b; margin-bottom:0.75rem;'>"
+        "🤖 Agent Pipeline — Event Log</div>",
+        unsafe_allow_html=True,
+    )
+
+    if not logs:
+        st.info("No agent events yet — deal a hand to see the pipeline in action.", icon="🤖")
+        return
+
+    tab_table, tab_timeline = st.tabs(["📋  Table", "🕐  Timeline"])
+
+    # ── TABLE VIEW ────────────────────────────────────────────────────────────
+    with tab_table:
+        rows = []
+        for e in logs:
+            rows.append({
+                "Day":     e.get("day", ""),
+                "Date":    e.get("date", ""),
+                "Time":    e.get("ts", ""),
+                "Agent":   e.get("agent", ""),
+                "Event":   e.get("event", ""),
+                "Message": e.get("message", ""),
+                "Trades":  len(e.get("trades", [])),
+                "Violations": len(e.get("violations", [])),
+            })
+        df_logs = pd.DataFrame(rows)
+
+        def _style_agent(val):
+            color = _AGENT_COLORS.get(val, ("#9ca3af", "#1f2937"))[0]
+            return f"color:{color}; font-weight:700"
+
+        def _style_event(val):
+            color = _EVENT_BADGES.get(val, ("#9ca3af", val))[0]
+            return f"color:{color}; font-weight:800"
+
+        def _style_violations(val):
+            if isinstance(val, int) and val > 0:
+                return "color:#ef4444; font-weight:700"
+            return "color:#6b7280"
+
+        st.dataframe(
+            df_logs.style
+            .map(_style_agent, subset=["Agent"])
+            .map(_style_event, subset=["Event"])
+            .map(_style_violations, subset=["Violations"]),
+            hide_index=True,
+            use_container_width=True,
+            height=min(400, 40 + len(rows) * 36),
+        )
+
+        st.divider()
+        if st.button("🗑️  Clear Log", key="clear_log_table"):
             try:
-                md.fetch_and_store_sp500(db)
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Failed: {exc}")
+                PortfolioDatabase().reset.__func__  # just check db is accessible
+            except Exception:
+                pass
+            # Clear from DB by running a raw delete
+            try:
+                db_instance = PortfolioDatabase()
+                with db_instance._conn() as c:
+                    c.execute("DELETE FROM agent_logs")
+            except Exception:
+                pass
+            st.session_state["agent_logs"] = []
+            st.rerun()
+
+    # ── TIMELINE VIEW ─────────────────────────────────────────────────────────
+    with tab_timeline:
+        from itertools import groupby
+        days = []
+        for day_key, group in groupby(logs, key=lambda e: (e.get("day", "?"), e.get("date", ""))):
+            days.append((day_key, list(group)))
+
+        for (day_num, date_str), events in reversed(days):
+            latest_day = days[-1][0][0]
+            with st.expander(
+                f"Day {day_num}  ·  {date_str}  ·  {len(events)} event(s)",
+                expanded=(day_num == latest_day),
+            ):
+                for entry in events:
+                    agent  = entry.get("agent", "Unknown")
+                    event  = entry.get("event", "")
+                    msg    = entry.get("message", "")
+                    ts     = entry.get("ts", "")
+
+                    ac, abg = _AGENT_COLORS.get(agent, ("#9ca3af", "#1f2937"))
+                    ec, elabel = _EVENT_BADGES.get(event, ("#9ca3af", event))
+
+                    st.markdown(
+                        f"<div style='display:flex; gap:0.75rem; align-items:flex-start; "
+                        f"padding:0.65rem 0; border-bottom:1px solid rgba(255,255,255,0.05);'>"
+                        f"<div style='min-width:110px; text-align:right;'>"
+                        f"<div style='font-size:0.6rem; color:#6b7280; font-family:monospace;'>{ts}</div>"
+                        f"<div style='display:inline-block; margin-top:3px; padding:2px 7px; "
+                        f"background:{abg}; border:1px solid {ac}44; border-radius:4px; "
+                        f"font-size:0.6rem; font-weight:700; color:{ac}; text-transform:uppercase; "
+                        f"letter-spacing:0.08em; white-space:nowrap;'>{agent}</div>"
+                        f"</div>"
+                        f"<div style='flex:1;'>"
+                        f"<span style='display:inline-block; padding:2px 8px; background:{ec}22; "
+                        f"border:1px solid {ec}55; border-radius:4px; font-size:0.6rem; "
+                        f"font-weight:800; color:{ec}; text-transform:uppercase; "
+                        f"letter-spacing:0.1em; margin-right:8px;'>{elabel}</span>"
+                        f"<span style='font-size:0.82rem; color:#d1d5db;'>{msg}</span>"
+                        f"</div>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    trades = entry.get("trades", [])
+                    if trades:
+                        with st.expander(f"  ↳ {len(trades)} trade(s)", expanded=False):
+                            st.dataframe(
+                                [{"Action": t.get("action",""), "Ticker": t.get("ticker",""),
+                                  "Alloc %": f"{t.get('pct',0):.1f}%",
+                                  "Reasoning": t.get("reasoning","")} for t in trades],
+                                hide_index=True, use_container_width=True,
+                            )
+
+                    violations = entry.get("violations", [])
+                    if violations:
+                        v_html = "".join(
+                            f"<div style='font-size:0.72rem;color:#fca5a5;padding:2px 0;'>⚠️ {v}</div>"
+                            for v in violations
+                        )
+                        st.markdown(
+                            f"<div style='margin:4px 0 4px 120px;background:rgba(239,68,68,0.07);"
+                            f"border-left:2px solid #ef4444;border-radius:0 4px 4px 0;"
+                            f"padding:6px 10px;'>{v_html}</div>",
+                            unsafe_allow_html=True,
+                        )
+
+        st.divider()
+        if st.button("🗑️  Clear Log", key="clear_log_timeline"):
+            try:
+                db_instance = PortfolioDatabase()
+                with db_instance._conn() as c:
+                    c.execute("DELETE FROM agent_logs")
+            except Exception:
+                pass
+            st.session_state["agent_logs"] = []
+            st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1450,56 +1872,148 @@ def render_roulette():
 # Deal-next-hand logic (shared by button click and auto-deal after Start Game)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _deal_next_hand(db: "PortfolioDatabase") -> None:
+def _log_agent(entry: dict) -> None:
+    """Append a structured log entry to session state and persist to DB."""
+    import datetime as _dt
+    entry.setdefault("ts", _dt.datetime.now().strftime("%H:%M:%S"))
+    st.session_state.setdefault("agent_logs", []).append(entry)
+    try:
+        _db_path = (BACKTEST_DB_PATH
+                    if st.session_state.get("app_mode") == "backtest"
+                    else DB_PATH)
+        PortfolioDatabase(_db_path).save_agent_log(entry)
+    except Exception:
+        pass  # never let logging break the app
+
+
+def _deal_next_hand(
+    db: "PortfolioDatabase",
+    backtest_date: "pd.Timestamp | None" = None,
+) -> None:
     """
-    Run the full proposal pipeline for the next simulation day and store the
-    result in st.session_state["pending_day_data"]. Finishes with st.rerun()
-    so the trade-confirmation dialog fires on the next pass.
+    Run the full proposal pipeline for the next simulation day.
+
+    backtest_date – when set (backtest mode), use this historical date directly
+                    and skip the live market-data refresh step.
+
+    Pipeline:
+      DataAgent → StrategyAgent → RiskAgent (pre-validate)
+        └─ if violations → StrategyAgent (retry with feedback, up to 2 retries)
+      Stores result in pending_day_data; dialog fires on next rerun.
     """
     day_num      = st.session_state["sim_day_num"]
     strategy_now = st.session_state["sim_strategy"]
 
-    # 1. Pull in the latest market close prices
-    with st.spinner("Fetching latest market data …"):
-        try:
-            md.refresh_latest_day(CSV_PATH)
-            st.cache_data.clear()
-        except Exception as exc:
-            st.warning(f"Could not refresh market data: {exc}")
+    # ── 1. Fetch latest market data (simulation only) ─────────────────────────
+    if backtest_date is None:
+        with st.spinner("Fetching latest market data …"):
+            try:
+                md.refresh_latest_prices(db)
+                md.fetch_and_store_sp500(db)
+                st.cache_data.clear()
+            except Exception as exc:
+                st.warning(f"Could not refresh market data: {exc}")
+        prices_df_fresh = load_price_data(db.db_path)
+        sim_date        = prices_df_fresh.index.max()
+    else:
+        # Backtest: prices already scoped to the backtest window in backtest DB
+        prices_df_fresh = load_price_data(db.db_path)
+        sim_date        = pd.Timestamp(backtest_date)
 
-    prices_df_fresh = load_price_data()
-    sim_date        = prices_df_fresh.index.max()
-    date_str        = sim_date.strftime("%Y-%m-%d")
+    date_str = sim_date.strftime("%Y-%m-%d")
     prices          = prices_df_fresh.loc[sim_date].to_dict()
     portfolio       = db.get_portfolio_state(prices)
 
-    # 2. Run analysis + strategy (proposal phase only — execution waits for
-    #    user confirmation in the dialog)
-    _spinner_msg = (
-        f"Asking Claude to propose Day {day_num} trades …"
-        if API_KEY
-        else f"Analysing Day {day_num} (deterministic mode) …"
-    )
-    with st.spinner(_spinner_msg):
-        data_agent     = DataAgent()
-        strategy_agent = StrategyAgent(strategy_now)
-        analysis       = data_agent.analyze(prices_df_fresh, sim_date)
-        proposed       = strategy_agent.propose_trades(
-            analysis, portfolio, date_str, day_num
-        )
+    _log_agent({"day": day_num, "date": date_str, "agent": "Data Agent",
+                "event": "ANALYZE",
+                "message": f"Analysed {len(prices)} tickers for {date_str}."})
 
-    # 3. Store payload; the dialog fires on the next rerun
+    # ── 2. Strategy → Risk feedback loop (max 3 attempts) ────────────────────
+    _spinner_base = "Asking Claude" if API_KEY else "Running deterministic strategy"
+    data_agent     = DataAgent()
+    strategy_agent = StrategyAgent(strategy_now)
+    analysis       = data_agent.analyze(prices_df_fresh, sim_date)
+
+    feedback   : list[str] | None = None
+    proposed   : list[dict] = []
+    risk_violations: list[str] = []
+    MAX_RETRIES = 3
+
+    for attempt in range(MAX_RETRIES):
+        attempt_label = f"attempt {attempt + 1}/{MAX_RETRIES}" if attempt > 0 else ""
+        spinner_msg   = (
+            f"{_spinner_base} — Day {day_num} trades"
+            + (f" ({attempt_label}, revising after risk feedback)" if attempt_label else " …")
+        )
+        with st.spinner(spinner_msg):
+            proposed = strategy_agent.propose_trades(
+                analysis, portfolio, date_str, day_num, feedback=feedback
+            )
+
+        n_sell = sum(1 for p in proposed if p["action"] == "SELL")
+        n_buy  = sum(1 for p in proposed if p["action"] == "BUY")
+        _log_agent({
+            "day": day_num, "date": date_str,
+            "agent": "Strategy Agent",
+            "event": "PROPOSE" if attempt == 0 else "REVISE",
+            "message": (
+                f"Proposed {n_sell} SELL(s) + {n_buy} BUY(s)."
+                + (f" [Revision {attempt}]" if attempt > 0 else "")
+            ),
+            "trades": [{"ticker": p["ticker"], "action": p["action"],
+                        "pct": p.get("pct_of_portfolio", 0),
+                        "reasoning": p.get("reasoning", "")} for p in proposed],
+            "reasoning": strategy_agent.reasoning,
+            "api_failed": strategy_agent.api_failed,
+        })
+
+        # Pre-validate with RiskAgent
+        risk_agent = RiskAgent()
+        risk_agent.validate(proposed, portfolio, prices)
+        risk_violations = risk_agent.violations.copy()
+
+        rejected = [v for v in risk_violations if v.startswith("REJECTED")]
+
+        if rejected:
+            _log_agent({
+                "day": day_num, "date": date_str,
+                "agent": "Risk Agent",
+                "event": "REJECT",
+                "message": f"{len(rejected)} violation(s) on attempt {attempt + 1}.",
+                "violations": risk_violations,
+            })
+            if attempt < MAX_RETRIES - 1:
+                feedback = risk_violations   # pass to next strategy iteration
+                continue
+        else:
+            _log_agent({
+                "day": day_num, "date": date_str,
+                "agent": "Risk Agent",
+                "event": "APPROVE",
+                "message": (
+                    "All proposed trades passed risk constraints."
+                    + (f" {len(risk_violations)} trim(s) applied."
+                       if risk_violations else "")
+                ),
+                "violations": risk_violations,
+            })
+        break   # no hard rejections — proceed
+
+    # ── 3. Store payload; dialog fires on next rerun ──────────────────────────
     st.session_state["pending_day_data"] = {
-        "proposals":  proposed,
-        "analysis":   analysis,
-        "sim_date":   sim_date,
-        "prices":     prices,
-        "strategy":   strategy_now,
-        "reasoning":  strategy_agent.reasoning,
-        "day_num":    day_num,
-        "portfolio":  portfolio,
-        "api_failed": strategy_agent.api_failed,
-        "api_error":  strategy_agent.api_error,
+        "proposals":       proposed,
+        "analysis":        analysis,
+        "sim_date":        sim_date,
+        "prices":          prices,
+        "strategy":        strategy_now,
+        "reasoning":       strategy_agent.reasoning,
+        "day_num":         day_num,
+        "portfolio":       portfolio,
+        "api_failed":      strategy_agent.api_failed,
+        "api_error":       strategy_agent.api_error,
+        "risk_violations": risk_violations,
+        # backtest_date is set in backtest mode so the dialog skips the advance-date gate
+        "backtest_date":   date_str if backtest_date is not None else None,
     }
     st.rerun()
 
@@ -1534,6 +2048,683 @@ def _restore_session_from_db(db: PortfolioDatabase) -> None:
     st.session_state["sim_capital"]      = INITIAL_CAPITAL
     st.session_state["sim_strategy"]     = "Momentum"
     st.session_state["pending_day_data"] = None
+    st.session_state["agent_logs"]       = db.load_agent_logs()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Loading screen
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _show_loading_screen() -> None:
+    """Animated full-page loading splash shown once on cold app start."""
+    st.markdown(
+        _LOADING_SCREEN_CSS + """
+<div style="min-height:100vh;width:100%;background:#0a0a0a;
+            display:flex;flex-direction:column;
+            align-items:center;justify-content:center;gap:1.6rem;">
+  <div style="font-size:5.5rem;animation:ld-spin 1.4s linear infinite;
+              display:inline-block;filter:drop-shadow(0 0 20px rgba(245,158,11,0.4));">🎰</div>
+  <div style="text-align:center;">
+    <h1 style="font-weight:900;color:#f1f5f9;text-transform:uppercase;
+               letter-spacing:0.08em;font-size:1.85rem;margin:0 0 0.5rem;">
+      AI Investment Application
+    </h1>
+    <div style="color:#f59e0b;font-size:0.75rem;font-weight:800;
+                text-transform:uppercase;letter-spacing:0.28em;">
+      Initialising market engine&hellip;
+    </div>
+  </div>
+  <div style="display:flex;gap:7px;margin-top:0.2rem;">
+    <span class="ld-dot"></span>
+    <span class="ld-dot" style="animation-delay:.18s"></span>
+    <span class="ld-dot" style="animation-delay:.36s"></span>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    time.sleep(1.8)
+    st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# New-game onboarding screens
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _render_mode_select() -> None:
+    """Full-page mode selection screen — shown on fresh load and 'Start New Game'."""
+    st.markdown("""
+<style>
+header,[data-testid="stToolbar"],[data-testid="stDecoration"]{display:none!important}
+.block-container{padding:0!important;max-width:860px!important;margin:0 auto!important;}
+@keyframes ms-fade{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:none;}}
+</style>
+""", unsafe_allow_html=True)
+
+    _err = st.session_state.pop("_new_game_error", None)
+    if _err:
+        st.error(f"Error: {_err}")
+
+    # Check if an active simulation exists (backtest always starts fresh).
+    _sim_db_check   = PortfolioDatabase(DB_PATH)
+    _sim_has_trades = bool(_sim_db_check.load_all_day_results())
+
+    st.markdown("""
+<div style="padding:2vh 1.5rem 1.2rem;text-align:center;animation:ms-fade 0.55s ease-out;">
+  <div style="font-size:4.5rem;margin-bottom:0.6rem;">🎰</div>
+  <div style="font-size:0.68rem;font-weight:800;text-transform:uppercase;
+              letter-spacing:0.4em;color:#f59e0b;margin-bottom:0.4rem;">Select Mode</div>
+  <h1 style="font-size:2.6rem;font-weight:900;color:#f1f5f9;text-transform:uppercase;
+             letter-spacing:0.05em;margin:0 0 0.3rem;line-height:1.1;">
+    How Do You Want to Play?
+  </h1>
+  <p style="color:#6b7280;font-size:0.85rem;margin:0 0 1.2rem;letter-spacing:0.06em;">
+    Choose your trading mode to get started
+  </p>
+</div>
+""", unsafe_allow_html=True)
+
+    col_sim, col_bt = st.columns(2, gap="large")
+
+    with col_sim:
+        with st.container(border=True):
+            st.markdown("""
+<div style="text-align:center;padding:1rem 1rem 0.5rem;">
+  <div style="font-size:3rem;margin-bottom:0.6rem;">📈</div>
+  <div style="font-size:1.15rem;font-weight:900;color:#f1f5f9;text-transform:uppercase;
+              letter-spacing:0.06em;margin-bottom:0.7rem;">Live Simulation</div>
+  <div style="font-size:0.8rem;color:#9ca3af;line-height:1.7;margin-bottom:1.2rem;">
+    Trade in real time.<br>
+    Advance one day per 24 hours.<br>
+    Uses today's live market data.
+  </div>
+  <div style="font-size:0.62rem;color:#10b981;letter-spacing:0.06em;
+              line-height:1.9;margin-bottom:1.2rem;">
+    ✓ Live S&amp;P 500 data &nbsp;·&nbsp; ✓ Claude AI strategy<br>
+    ✓ 14-day game (~10 trades) &nbsp;·&nbsp; ✓ vs S&amp;P 500
+  </div>
+</div>""", unsafe_allow_html=True)
+            # Show "Continue" as primary CTA if an active simulation exists.
+            if _sim_has_trades:
+                if st.button("▶  Continue Simulation", type="primary", use_container_width=True):
+                    st.session_state["app_mode"] = "simulation"
+                    st.session_state["new_game_stage"] = None
+                    st.rerun()
+                if st.button("📈  New Simulation", use_container_width=True):
+                    st.session_state["app_mode"] = "simulation"
+                    st.session_state["new_game_stage"] = "resetting"
+                    st.rerun()
+            else:
+                if st.button("📈  Start Simulation", type="primary", use_container_width=True):
+                    st.session_state["app_mode"] = "simulation"
+                    st.session_state["new_game_stage"] = "resetting"
+                    st.rerun()
+
+    with col_bt:
+        with st.container(border=True):
+            st.markdown("""
+<div style="text-align:center;padding:1rem 1rem 0.5rem;">
+  <div style="font-size:3rem;margin-bottom:0.6rem;">⏱️</div>
+  <div style="font-size:1.15rem;font-weight:900;color:#f1f5f9;text-transform:uppercase;
+              letter-spacing:0.06em;margin-bottom:0.7rem;">Back Testing</div>
+  <div style="font-size:0.8rem;color:#9ca3af;line-height:1.7;margin-bottom:1.2rem;">
+    Replay historical market data.<br>
+    Advance at your own pace.<br>
+    Test strategy on the past.
+  </div>
+  <div style="font-size:0.62rem;color:#60a5fa;letter-spacing:0.06em;
+              line-height:1.9;margin-bottom:1.2rem;">
+    ✓ History from 2020 &nbsp;·&nbsp; ✓ No time restrictions<br>
+    ✓ 14-day window &nbsp;·&nbsp; ✓ Strategy validation
+  </div>
+</div>""", unsafe_allow_html=True)
+            # Backtest always starts fresh — no continue option.
+            if st.button("⏱️  Start Back Testing", use_container_width=True):
+                st.session_state["app_mode"] = "backtest"
+                st.session_state["new_game_stage"] = "bt_setup"
+                st.rerun()
+
+
+def _render_bt_setup() -> None:
+    """Back testing date-selection screen."""
+    st.markdown("""
+<style>
+header,[data-testid="stToolbar"],[data-testid="stDecoration"]{display:none!important}
+.block-container{padding:0!important;max-width:620px!important;margin:0 auto!important;}
+@keyframes bs-fade{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:none;}}
+.stButton button[kind="primary"]{
+  background:linear-gradient(135deg,#3b82f6 0%,#2563eb 100%)!important;
+  color:#fff!important;font-weight:900!important;}
+</style>
+""", unsafe_allow_html=True)
+
+    _err = st.session_state.pop("_new_game_error", None)
+    if _err:
+        st.error(f"Setup failed: {_err} — please try again.")
+
+    st.markdown("""
+<div style="padding:2vh 1.5rem 1rem;text-align:center;animation:bs-fade 0.5s ease-out;">
+  <div style="font-size:3.5rem;margin-bottom:0.5rem;">⏱️</div>
+  <div style="font-size:0.68rem;font-weight:800;text-transform:uppercase;
+              letter-spacing:0.4em;color:#3b82f6;margin-bottom:0.4rem;">Configure</div>
+  <h1 style="font-size:2.2rem;font-weight:900;color:#f1f5f9;text-transform:uppercase;
+             letter-spacing:0.05em;margin:0 0 0.3rem;">Back Testing Setup</h1>
+  <p style="color:#6b7280;font-size:0.85rem;margin:0 0 1rem;letter-spacing:0.05em;">
+    Pick a start date — the AI will replay the strategy day by day from there
+  </p>
+</div>
+""", unsafe_allow_html=True)
+
+    sim_db    = PortfolioDatabase(DB_PATH)
+    all_dates = sim_db.get_prices_dates()  # fast: distinct dates only, no price data loaded
+
+    from datetime import timedelta as _td, date as _date
+    _BT_WINDOW = 14  # calendar days per backtest game
+
+    # Picker always spans 2020-01-01 → today-15d.
+    # Preview card shows 0 trading days if the selected range has no data yet.
+    min_date     = _date(2020, 1, 1)
+    max_date     = _date.today() - _td(days=15)
+    default_date = max(min_date, max_date - _td(days=30))
+
+    _, date_col, _ = st.columns([1, 3, 1])
+    with date_col:
+        st.markdown(
+            "<div style='font-size:0.78rem;font-weight:700;color:#94a3b8;"
+            "text-transform:uppercase;letter-spacing:0.08em;margin-bottom:0.4rem;"
+            "text-align:center;'>"
+            "📅 Backtest Start Date</div>",
+            unsafe_allow_html=True,
+        )
+        _yr_col, _mo_col, _dy_col = st.columns([1, 1, 1])
+
+        _years  = list(range(min_date.year, max_date.year + 1))
+        _months = ["Jan","Feb","Mar","Apr","May","Jun",
+                   "Jul","Aug","Sep","Oct","Nov","Dec"]
+
+        # ── Initialise / clamp the picker state ──────────────────────────────
+        _ss_y = st.session_state.get("_bt_pick_year",  default_date.year)
+        _ss_m = st.session_state.get("_bt_pick_month", default_date.month)
+        _ss_d = st.session_state.get("_bt_pick_day",   default_date.day)
+
+        with _yr_col:
+            _sel_year = st.selectbox(
+                "Year", options=_years,
+                index=_years.index(_ss_y) if _ss_y in _years else len(_years) - 1,
+                label_visibility="visible", key="_bt_pick_year",
+            )
+        with _mo_col:
+            _sel_month = st.selectbox(
+                "Month", options=list(range(1, 13)),
+                index=_ss_m - 1,
+                format_func=lambda m: _months[m - 1],
+                label_visibility="visible", key="_bt_pick_month",
+            )
+        with _dy_col:
+            import calendar as _cal
+            _max_day_in_month = _cal.monthrange(_sel_year, _sel_month)[1]
+            _day_opts = list(range(1, _max_day_in_month + 1))
+            _clamped_day = min(_ss_d, _max_day_in_month)
+            _sel_day = st.selectbox(
+                "Day", options=_day_opts,
+                index=_clamped_day - 1,
+                label_visibility="visible", key="_bt_pick_day",
+            )
+
+        # Clamp to allowed range
+        import datetime as _dt_mod
+        _raw_date = _dt_mod.date(_sel_year, _sel_month, _sel_day)
+        selected_date = max(min_date, min(max_date, _raw_date))
+
+        if selected_date != _raw_date:
+            st.caption(f"⚠️ Clamped to allowed range: {selected_date}")
+
+        # 14-calendar-day window from selected start
+        _start_ts = pd.Timestamp(selected_date)
+        _end_ts   = _start_ts + pd.Timedelta(days=_BT_WINDOW - 1)
+        bt_dates  = [d for d in all_dates if _start_ts <= d <= _end_ts]
+        n_days    = len(bt_dates)
+        end_label = _end_ts.strftime("%b %d, %Y")
+
+        _no_data = n_days == 0
+        if _no_data:
+            # No prices cached yet for this window — will be fetched on start
+            st.markdown(f"""
+<div style="background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.18);
+            border-radius:10px;padding:1rem 1.2rem;text-align:center;margin:1rem 0;">
+  <div style="font-size:0.75rem;font-weight:700;color:#60a5fa;margin-bottom:4px;">
+    ⏳ Price data will be fetched on start
+  </div>
+  <div style="font-size:0.6rem;text-transform:uppercase;letter-spacing:0.1em;
+              color:#4b5563;margin-top:3px;">This takes ~1 min the first time</div>
+  <div style="font-size:0.65rem;color:#374151;margin-top:8px;">
+    14-day window: {selected_date.strftime("%b %d, %Y")} → {end_label}
+  </div>
+</div>""", unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+<div style="background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.22);
+            border-radius:10px;padding:1rem 1.2rem;text-align:center;margin:1rem 0;">
+  <div style="font-size:2rem;font-weight:900;font-family:monospace;color:#60a5fa;">{n_days}</div>
+  <div style="font-size:0.6rem;text-transform:uppercase;letter-spacing:0.12em;
+              color:#6b7280;margin-top:3px;">Trading days in this window</div>
+  <div style="font-size:0.65rem;color:#4b5563;margin-top:8px;">
+    14-day window: {selected_date.strftime("%b %d, %Y")} → {end_label}
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        if st.button("⏱️  Begin Back Testing", type="primary", use_container_width=True):
+            st.session_state["bt_start_date"] = selected_date.isoformat()
+            st.session_state["new_game_stage"] = "bt_resetting"
+            st.rerun()
+
+        st.markdown("<div style='margin-top:0.4rem;'></div>", unsafe_allow_html=True)
+        if st.button("← Back to Mode Select", use_container_width=True):
+            st.session_state["new_game_stage"] = "mode_select"
+            st.rerun()
+
+
+def _start_backtest_with_loading(db: "PortfolioDatabase") -> None:
+    """Reset the backtest DB and configure session state for back-testing."""
+
+    # Ensure the simulation DB has full price history first
+    _BT_WINDOW     = 14  # calendar days per backtest game
+    start_date_str = st.session_state.get("bt_start_date", "")
+    sim_db = PortfolioDatabase(DB_PATH)
+
+    if not sim_db.has_prices():
+        st.markdown(_loading_overlay(
+            "Setting Up Backtest",
+            "Fetching S&P 500 history since 2019 &mdash; this takes about a minute&hellip;",
+        ), unsafe_allow_html=True)
+        try:
+            md.fetch_and_store_prices(sim_db, start="2019-01-01")
+            st.cache_data.clear()
+        except Exception as exc:
+            st.session_state["new_game_stage"]  = "bt_setup"
+            st.session_state["_new_game_error"] = f"Price fetch failed: {exc}"
+            st.rerun()
+            return
+    else:
+        st.markdown(_loading_overlay("Setting Up Backtest", "Preparing historical data&hellip;"),
+                    unsafe_allow_html=True)
+
+    try:
+        db.reset_all(INITIAL_CAPITAL)
+        st.cache_data.clear()
+    except Exception as exc:
+        st.session_state["new_game_stage"]  = "bt_setup"
+        st.session_state["_new_game_error"] = str(exc)
+        st.rerun()
+        return
+
+    try:
+        start_ts = pd.Timestamp(start_date_str) if start_date_str else None
+        if start_ts is None:
+            raise ValueError("No backtest start date set.")
+
+        end_ts       = start_ts + pd.Timedelta(days=_BT_WINDOW - 1)
+        buffer_start = start_ts - pd.Timedelta(days=90)  # ~60 trading-day lookback
+
+        # Copy the relevant window from simulation DB into backtest DB
+        prices_window = sim_db.load_prices(cutoff_date=end_ts)
+        if not prices_window.empty:
+            prices_window = prices_window[prices_window.index >= buffer_start]
+            db.upsert_prices(prices_window)
+
+        bt_dates = [d for d in prices_window.index if start_ts <= d <= end_ts]
+    except Exception as exc:
+        st.session_state["new_game_stage"]  = "bt_setup"
+        st.session_state["_new_game_error"] = f"Price data load failed: {exc}"
+        st.rerun()
+        return
+
+    if not bt_dates:
+        st.session_state["new_game_stage"]  = "bt_setup"
+        st.session_state["_new_game_error"] = "No trading dates found in the selected range."
+        st.rerun()
+        return
+
+    st.session_state.update({
+        "new_game_stage":   "bt_ready",   # show welcome screen before first trade
+        "app_mode":         "backtest",
+        "sim_started":      True,
+        "sim_date_idx":     0,
+        "sim_day_num":      1,
+        "sim_dates":        bt_dates,
+        "daily_results":    [],
+        "sim_capital":      INITIAL_CAPITAL,
+        "sim_strategy":     "Momentum",
+        "report_date":      "",
+        "portfolio_report": None,
+        "pending_day_data": None,
+        "agent_logs":       [],
+        "auto_deal":        True,
+    })
+    st.rerun()
+
+
+def _render_bt_ready() -> None:
+    """
+    Full-page welcome screen shown after backtest setup completes —
+    before the first trade is executed.  The user clicks 'Start Backtesting'
+    to advance to the live backtest view.
+    """
+    bt_start_str = st.session_state.get("bt_start_date", "")
+    bt_dates     = st.session_state.get("sim_dates", [])
+    n_days       = len(bt_dates)
+
+    try:
+        _start_ts = pd.Timestamp(bt_start_str)
+        _end_ts   = pd.Timestamp(bt_dates[-1]) if bt_dates else _start_ts
+        date_range_label = (
+            f"{_start_ts.strftime('%d %b %Y')} → {_end_ts.strftime('%d %b %Y')}"
+        )
+    except Exception:
+        date_range_label = bt_start_str
+
+    st.markdown("""
+<style>
+header,[data-testid="stToolbar"],[data-testid="stDecoration"]{display:none!important}
+.block-container{padding:0!important;max-width:780px!important;margin:0 auto!important;}
+.stButton button {
+    background:linear-gradient(135deg,#3b82f6 0%,#1d4ed8 100%)!important;
+    color:#fff!important;font-weight:900!important;font-size:1.05rem!important;
+    text-transform:uppercase!important;letter-spacing:0.22em!important;
+    padding:0.9rem 1rem!important;border-radius:10px!important;border:none!important;
+    box-shadow:0 0 32px rgba(59,130,246,0.4),0 0 64px rgba(59,130,246,0.12)!important;
+    transition:box-shadow 0.2s,transform 0.15s!important;
+}
+.stButton button:hover {
+    box-shadow:0 0 55px rgba(59,130,246,0.65),0 0 110px rgba(59,130,246,0.28)!important;
+    transform:translateY(-2px)!important;
+}
+@keyframes bt-glow{0%,100%{filter:drop-shadow(0 0 18px rgba(59,130,246,0.4));}
+                   50%{filter:drop-shadow(0 0 36px rgba(59,130,246,0.8));}}
+@keyframes bt-fade{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:none;}}
+</style>
+""", unsafe_allow_html=True)
+
+    st.markdown(f"""
+<div style="padding:4vh 1.5rem 1.5rem;text-align:center;animation:bt-fade 0.55s ease-out;">
+
+  <div style="font-size:5rem;animation:bt-glow 2.5s ease-in-out infinite;
+              display:inline-block;margin-bottom:1rem;">⏱️</div>
+
+  <div style="font-size:0.68rem;font-weight:800;text-transform:uppercase;
+              letter-spacing:0.4em;color:#60a5fa;margin-bottom:0.6rem;">Backtest Ready</div>
+
+  <h1 style="font-size:2.8rem;font-weight:900;color:#f1f5f9;text-transform:uppercase;
+             letter-spacing:0.05em;margin:0 0 0.4rem;line-height:1.1;">
+    Time Machine Active
+  </h1>
+
+  <p style="color:#9ca3af;font-size:0.85rem;letter-spacing:0.1em;text-transform:uppercase;
+            font-weight:500;margin:0 0 1.8rem;">AI-Powered Historical Replay</p>
+
+  <div style="display:inline-flex;gap:2rem;justify-content:center;
+              background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.18);
+              border-radius:14px;padding:1rem 2.5rem;margin-bottom:2rem;">
+    <div style="text-align:center;">
+      <div style="font-size:0.55rem;font-weight:800;color:#60a5fa;text-transform:uppercase;
+                  letter-spacing:0.15em;margin-bottom:0.3rem;">Window</div>
+      <div style="font-size:1rem;font-weight:900;font-family:monospace;color:#f1f5f9;">
+        {date_range_label}
+      </div>
+    </div>
+    <div style="width:1px;background:rgba(59,130,246,0.2);"></div>
+    <div style="text-align:center;">
+      <div style="font-size:0.55rem;font-weight:800;color:#60a5fa;text-transform:uppercase;
+                  letter-spacing:0.15em;margin-bottom:0.3rem;">Trading Days</div>
+      <div style="font-size:2rem;font-weight:900;font-family:monospace;color:#f1f5f9;">
+        {n_days}
+      </div>
+    </div>
+    <div style="width:1px;background:rgba(59,130,246,0.2);"></div>
+    <div style="text-align:center;">
+      <div style="font-size:0.55rem;font-weight:800;color:#60a5fa;text-transform:uppercase;
+                  letter-spacing:0.15em;margin-bottom:0.3rem;">Starting Capital</div>
+      <div style="font-size:1rem;font-weight:900;font-family:monospace;color:#f1f5f9;">
+        ${INITIAL_CAPITAL:,.0f}
+      </div>
+    </div>
+  </div>
+
+</div>
+""", unsafe_allow_html=True)
+
+    _, btn_col, _ = st.columns([1, 2, 1])
+    with btn_col:
+        if st.button("⏱️  Start Backtesting", type="primary", use_container_width=True):
+            st.session_state["new_game_stage"] = None
+            st.rerun()
+
+    st.markdown("<div style='height:0.6rem;'></div>", unsafe_allow_html=True)
+    _, back_col, _ = st.columns([1, 2, 1])
+    with back_col:
+        if st.button("← Change Date", use_container_width=True):
+            st.session_state["new_game_stage"] = "bt_setup"
+            st.rerun()
+
+
+def _render_new_game_hero() -> None:
+    """Full-page hero/onboarding screen — shown when user clicks Start New Game."""
+    st.markdown("""
+<style>
+header,[data-testid="stToolbar"],[data-testid="stDecoration"]{display:none!important}
+.block-container{padding:0!important;max-width:780px!important;margin:0 auto!important;}
+.stButton button {
+    background:linear-gradient(135deg,#f59e0b 0%,#d97706 100%)!important;
+    color:#0a0a0a!important;font-weight:900!important;font-size:1.05rem!important;
+    text-transform:uppercase!important;letter-spacing:0.22em!important;
+    padding:0.9rem 1rem!important;border-radius:10px!important;border:none!important;
+    box-shadow:0 0 32px rgba(245,158,11,0.4),0 0 64px rgba(245,158,11,0.12)!important;
+    transition:box-shadow 0.2s,transform 0.15s!important;
+}
+.stButton button:hover {
+    box-shadow:0 0 55px rgba(245,158,11,0.65),0 0 110px rgba(245,158,11,0.28)!important;
+    transform:translateY(-2px)!important;
+}
+@keyframes ng-glow{0%,100%{filter:drop-shadow(0 0 18px rgba(245,158,11,0.4));}
+                   50%{filter:drop-shadow(0 0 36px rgba(245,158,11,0.8));}}
+@keyframes ng-fade{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:none;}}
+</style>
+""", unsafe_allow_html=True)
+
+    _err = st.session_state.pop("_new_game_error", None)
+    if _err:
+        st.error(f"Market data fetch failed: {_err}  —  please try again.")
+
+    st.markdown(f"""
+<div style="padding:3vh 1.5rem 1.5rem;text-align:center;animation:ng-fade 0.55s ease-out;">
+
+  <div style="font-size:5.5rem;animation:ng-glow 2.5s ease-in-out infinite;
+              display:inline-block;margin-bottom:1.6rem;">🎰</div>
+
+  <div style="font-size:0.68rem;font-weight:800;text-transform:uppercase;
+              letter-spacing:0.4em;color:#f59e0b;margin-bottom:0.7rem;">Welcome to</div>
+
+  <h1 style="font-size:3.1rem;font-weight:900;color:#f1f5f9;text-transform:uppercase;
+             letter-spacing:0.05em;margin:0 0 0.45rem;line-height:1.1;">
+    The Trading Floor
+  </h1>
+
+  <p style="color:#9ca3af;font-size:0.9rem;letter-spacing:0.12em;text-transform:uppercase;
+            font-weight:500;margin:0 0 2.8rem;">AI-Powered Paper Trading Simulator</p>
+
+  <div style="display:flex;gap:1rem;justify-content:center;flex-wrap:wrap;margin-bottom:3rem;">
+    <div style="background:rgba(245,158,11,0.07);border:1px solid rgba(245,158,11,0.22);
+                border-radius:12px;padding:1rem 1.5rem;min-width:125px;">
+      <div style="font-size:1.45rem;font-weight:900;font-family:monospace;
+                  color:#f59e0b;line-height:1;">${INITIAL_CAPITAL:,.0f}</div>
+      <div style="font-size:0.56rem;font-weight:700;text-transform:uppercase;
+                  letter-spacing:0.14em;color:#6b7280;margin-top:5px;">Starting Capital</div>
+    </div>
+    <div style="background:rgba(16,185,129,0.07);border:1px solid rgba(16,185,129,0.22);
+                border-radius:12px;padding:1rem 1.5rem;min-width:125px;">
+      <div style="font-size:1.45rem;font-weight:900;font-family:monospace;
+                  color:#10b981;line-height:1;">500+</div>
+      <div style="font-size:0.56rem;font-weight:700;text-transform:uppercase;
+                  letter-spacing:0.14em;color:#6b7280;margin-top:5px;">S&amp;P 500 Universe</div>
+    </div>
+    <div style="background:rgba(139,92,246,0.07);border:1px solid rgba(139,92,246,0.22);
+                border-radius:12px;padding:1rem 1.5rem;min-width:125px;">
+      <div style="font-size:1.45rem;font-weight:900;font-family:monospace;
+                  color:#8b5cf6;line-height:1;">Claude</div>
+      <div style="font-size:0.56rem;font-weight:700;text-transform:uppercase;
+                  letter-spacing:0.14em;color:#6b7280;margin-top:5px;">AI Strategy</div>
+    </div>
+    <div style="background:rgba(59,130,246,0.07);border:1px solid rgba(59,130,246,0.22);
+                border-radius:12px;padding:1rem 1.5rem;min-width:125px;">
+      <div style="font-size:1.45rem;font-weight:900;font-family:monospace;
+                  color:#3b82f6;line-height:1;">3–5</div>
+      <div style="font-size:0.56rem;font-weight:700;text-transform:uppercase;
+                  letter-spacing:0.14em;color:#6b7280;margin-top:5px;">Max Positions</div>
+    </div>
+  </div>
+
+  <p style="color:#4b5563;font-size:0.65rem;font-weight:700;text-transform:uppercase;
+            letter-spacing:0.18em;line-height:1.8;margin:0 0 1.6rem;">
+    High-Volatility Mean Reversion&nbsp;·&nbsp;S&amp;P 500 Universe<br>
+    Equal-Weight Daily Rebalance&nbsp;·&nbsp;Risk-Managed by AI
+  </p>
+
+</div>
+""", unsafe_allow_html=True)
+
+    _, btn_col, _ = st.columns([2, 3, 2])
+    with btn_col:
+        if st.button("🎲  Begin Your Journey", type="primary", use_container_width=True):
+            st.session_state["new_game_stage"] = "fetching"
+            st.rerun()
+
+
+_LOADING_SCREEN_CSS = """
+<style>
+/* Hide all Streamlit chrome so nothing bleeds through loading screens */
+header,[data-testid="stToolbar"],[data-testid="stDecoration"],
+[data-testid="stSidebar"],#MainMenu,.viewerBadge_container__r5tak
+{ display:none !important; }
+/* Make every container behind our content transparent / zero-padded */
+[data-testid="stApp"],[data-testid="stAppViewContainer"],
+[data-testid="stMain"],section.main,.main
+{ background:#0a0a0a !important; padding:0 !important; }
+.block-container,[data-testid="stMainBlockContainer"]
+{ padding:0 !important; max-width:100% !important; background:#0a0a0a !important; }
+@keyframes ld-spin{to{transform:rotate(360deg);}}
+@keyframes ld-bounce{0%,80%,100%{transform:scale(0.4);opacity:0.25;}
+                     40%{transform:scale(1);opacity:1;}}
+.ld-dot{display:inline-block;width:10px;height:10px;border-radius:50%;
+        background:#f59e0b;animation:ld-bounce 1.3s infinite ease-in-out;}
+</style>
+"""
+
+def _loading_overlay(title: str, subtitle: str) -> str:
+    """
+    Full-screen loading card.  Uses min-height:100vh in normal document flow
+    (NOT position:fixed) so it works correctly inside Streamlit's CSS-contained
+    block structure without overlapping or leaking other page elements.
+    """
+    return f"""{_LOADING_SCREEN_CSS}
+<div style="min-height:100vh;width:100%;background:#0a0a0a;
+            display:flex;flex-direction:column;
+            align-items:center;justify-content:center;gap:1.6rem;">
+  <div style="font-size:5.5rem;animation:ld-spin 1.4s linear infinite;
+              display:inline-block;filter:drop-shadow(0 0 20px rgba(245,158,11,0.4));">🎰</div>
+  <div style="text-align:center;">
+    <h1 style="font-weight:900;color:#f1f5f9;text-transform:uppercase;
+               letter-spacing:0.08em;font-size:1.85rem;margin:0 0 0.5rem;">{title}</h1>
+    <div style="color:#f59e0b;font-size:0.75rem;font-weight:800;
+                text-transform:uppercase;letter-spacing:0.28em;">{subtitle}</div>
+  </div>
+  <div style="display:flex;gap:7px;margin-top:0.2rem;">
+    <span class="ld-dot"></span>
+    <span class="ld-dot" style="animation-delay:.18s"></span>
+    <span class="ld-dot" style="animation-delay:.36s"></span>
+  </div>
+</div>"""
+
+
+def _reset_game_with_loading(db: "PortfolioDatabase") -> None:
+    """
+    Immediately reset the DB and all session state, then show the hero screen.
+    Runs as soon as 'Start New Game' is clicked — no market fetch yet.
+
+    Uses db.reset() (keeps price history) so the subsequent _start_new_game_with_loading
+    can skip the full re-download and only top-up missing days.
+    """
+    st.markdown(_loading_overlay("Clearing the Table", "Resetting your portfolio&hellip;"),
+                unsafe_allow_html=True)
+
+    try:
+        db.reset(INITIAL_CAPITAL)   # keep prices — game state only
+        st.cache_data.clear()
+    except Exception as exc:
+        st.session_state["new_game_stage"]  = "mode_select"
+        st.session_state["_new_game_error"] = str(exc)
+        st.rerun()
+        return
+
+    st.session_state.update({
+        "new_game_stage":   "fetching",
+        "app_mode":         "simulation",
+        "sim_started":      False,
+        "sim_date_idx":     0,
+        "sim_day_num":      1,
+        "sim_dates":        [],
+        "daily_results":    [],
+        "sim_capital":      INITIAL_CAPITAL,
+        "sim_strategy":     "Momentum",
+        "report_date":      "",
+        "portfolio_report": None,
+        "pending_day_data": None,
+        "agent_logs":       [],
+    })
+    st.rerun()
+
+
+def _start_new_game_with_loading(db: "PortfolioDatabase") -> None:
+    """
+    Show a loading screen while syncing market data.
+    DB is already reset (game state only) by _reset_game_with_loading.
+    Reuses any prices already in portfolio.db or backtest.db — only
+    fetches genuinely missing data from yfinance.
+    """
+    st.markdown(_loading_overlay(
+        "Setting Up The Floor",
+        "Syncing latest market data&hellip;",
+    ), unsafe_allow_html=True)
+
+    try:
+        fresh_df = _sync_sim_prices(db)   # smart: copy/top-up, no full re-download
+        st.cache_data.clear()
+    except Exception as exc:
+        st.session_state["new_game_stage"]  = "mode_select"
+        st.session_state["_new_game_error"] = str(exc) or "Failed to sync market data."
+        st.rerun()
+        return
+
+    fresh_df.index = pd.to_datetime(fresh_df.index)
+    fresh_df = fresh_df.sort_index()
+    sim_dates = fresh_df.index[-SIMULATION_DAYS:].tolist()
+
+    st.session_state.update({
+        "new_game_stage":   None,
+        "app_mode":         "simulation",
+        "sim_started":      True,
+        "sim_date_idx":     0,
+        "sim_day_num":      1,
+        "sim_dates":        sim_dates,
+        "daily_results":    [],
+        "sim_capital":      INITIAL_CAPITAL,
+        "sim_strategy":     "Momentum",
+        "report_date":      "",
+        "portfolio_report": None,
+        "pending_day_data": None,
+        "agent_logs":       [],
+        "auto_deal":        True,
+    })
+    st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1541,18 +2732,60 @@ def _restore_session_from_db(db: PortfolioDatabase) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    db = PortfolioDatabase()
+    # ── Loading screen + price history fetch on first browser visit ───────────
+    # The loading screen HTML renders immediately while _ensure_price_history()
+    # runs in the background. After the fetch completes, st.rerun() takes the
+    # user straight to the mode-select screen with prices ready.
+    if "app_initialized" not in st.session_state:
+        st.session_state["app_initialized"] = True
+        _show_loading_screen()
+        _ensure_price_history()   # fetch/refresh while the splash is visible
+        st.rerun()
+        return
+
+    # ── Choose DB based on mode (defaults to simulation) ─────────────────────
+    app_mode = st.session_state.get("app_mode", "simulation")
+    db = PortfolioDatabase(BACKTEST_DB_PATH if app_mode == "backtest" else DB_PATH)
 
     # ── Restore simulation state from DB on fresh page load ──────────────────
     # Must run BEFORE the defaults loop so restored keys are not overwritten.
     _restore_session_from_db(db)
 
-    # Load price data only if the CSV exists (created by Start New Game)
-    _csv_ready = Path(CSV_PATH).exists()
-    prices_df  = load_price_data() if _csv_ready else None
+    # ── New-game onboarding screens (intercept before anything else) ──────────
+    # On every fresh browser session (page reload), the key won't exist yet —
+    # always land on mode_select so the user can consciously choose.
+    # Active-session detection is surfaced as "Continue" buttons inside that screen.
+    if "new_game_stage" not in st.session_state:
+        st.session_state["new_game_stage"] = "mode_select"
+
+    _new_game_stage = st.session_state.get("new_game_stage")
+    if _new_game_stage == "mode_select":
+        _render_mode_select()
+        return
+    if _new_game_stage == "resetting":
+        _reset_game_with_loading(db)
+        return
+    if _new_game_stage == "fetching":
+        _start_new_game_with_loading(db)
+        return
+    if _new_game_stage == "bt_setup":
+        _render_bt_setup()
+        return
+    if _new_game_stage == "bt_resetting":
+        _start_backtest_with_loading(db)
+        return
+    if _new_game_stage == "bt_ready":
+        _render_bt_ready()
+        return
+
+    # Load price data from the active DB's prices table
+    _prices_ready = db.has_prices()
+    prices_df  = load_price_data(db.db_path) if _prices_ready else None
 
     # ── Session state init (only sets keys not yet present) ──────────────────
     defaults = {
+        "app_mode":          "simulation",  # "simulation" | "backtest"
+        "bt_start_date":     "",            # ISO date string for backtest start
         "sim_started":       False,
         "sim_date_idx":      0,
         "sim_day_num":       1,
@@ -1562,13 +2795,18 @@ def main():
         "sim_strategy":      "Momentum",
         "portfolio_report":  None,
         "report_date":       "",
-        "pending_day_data":  None,   # set when waiting for trade confirmation
+        "pending_day_data":  None,
+        "new_game_stage":    None,
         # roulette
         "roulette_wins":     0,
         "roulette_losses":   0,
         "roulette_streak":   0,
         "roulette_result":   None,
+        # agent pipeline logs
+        "agent_logs":        [],
     }
+    # Keep app_mode in sync after the defaults loop sets it
+    app_mode = st.session_state.get("app_mode", "simulation")
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
@@ -1579,71 +2817,149 @@ def main():
     if st.session_state.get("pending_day_data") is not None:
         show_proposals_dialog(db, today_str)
 
-    # ── Auto-generate portfolio report once per calendar day ─────────────────
-    # Only runs after Start New Game has populated the price CSV
-    if _csv_ready and st.session_state["report_date"] != today_str:
+    # ── Auto-generate portfolio report (once per day in sim; once per step in bt)
+    # Report key changes every backtest step so we re-run after each advance.
+    if app_mode == "backtest":
+        _report_key = f"bt_day_{st.session_state.get('sim_day_num', 0)}"
+    else:
+        _report_key = today_str
+
+    if _prices_ready and st.session_state["report_date"] != _report_key:
         with st.spinner("Generating daily briefing …"):
             try:
                 data_agent = DataAgent()
+                # In backtest mode, only show prices up to the last completed step
+                _prices_for_report = prices_df
+                if app_mode == "backtest" and prices_df is not None:
+                    _bt_dates_list = st.session_state.get("sim_dates", [])
+                    _bt_idx        = st.session_state.get("sim_date_idx", 0)
+                    if 0 < _bt_idx <= len(_bt_dates_list):
+                        _last_bt = pd.Timestamp(_bt_dates_list[_bt_idx - 1])
+                        _prices_for_report = prices_df[prices_df.index <= _last_bt]
                 st.session_state["portfolio_report"] = data_agent.generate_portfolio_report(
-                    db, prices_df
+                    db, _prices_for_report
                 )
-                st.session_state["report_date"] = today_str
+                st.session_state["report_date"] = _report_key
             except Exception as exc:
                 st.session_state["portfolio_report"] = None
                 logger.warning("Portfolio report failed: %s", exc)
 
     # ── Compute advance flags (needed for control strip + auto-deal) ─────────
-    already_ran_today = db.get_last_advance_date() == today_str
-    dates_remaining   = (
-        st.session_state["sim_started"]
-        and st.session_state["sim_date_idx"] < SIMULATION_DAYS
-    )
+    if app_mode == "backtest":
+        # No time gates in backtest — advance freely through historical dates
+        already_ran_today = False
+        _is_weekend       = False
+        dates_remaining   = (
+            st.session_state["sim_started"]
+            and st.session_state["sim_date_idx"] < len(st.session_state.get("sim_dates", []))
+        )
+    else:
+        already_ran_today = db.get_last_advance_date() == today_str
+        _is_weekend       = date.today().weekday() >= 5   # 5=Sat, 6=Sun
+        dates_remaining   = (
+            st.session_state["sim_started"]
+            and st.session_state["sim_date_idx"] < SIMULATION_DAYS
+        )
+
     pending_confirm = st.session_state.get("pending_day_data") is not None
+    # Day-advancement gate: weekends block advancing to the next trading day,
+    # but the initial auto-deal on simulation start is allowed any day.
     can_advance = (
+        dates_remaining
+        and not already_ran_today
+        and not pending_confirm
+        and not _is_weekend
+        and prices_df is not None
+    )
+    # Auto-deal gate: same as can_advance but without the weekend restriction
+    # so a new simulation can be started and the first hand dealt on any day.
+    _can_auto_deal = (
         dates_remaining
         and not already_ran_today
         and not pending_confirm
         and prices_df is not None
     )
 
-    # Auto-deal: fires once on the rerun immediately after Start New Game
-    if st.session_state.pop("auto_deal", False) and can_advance:
-        _deal_next_hand(db)
+    def _do_deal():
+        """Call _deal_next_hand with the right date (backtest or live)."""
+        if app_mode == "backtest":
+            _idx  = st.session_state["sim_date_idx"]
+            _date = st.session_state["sim_dates"][_idx]
+            _deal_next_hand(db, backtest_date=_date)
+        else:
+            _deal_next_hand(db)
+
+    # Auto-deal: fires once on the rerun immediately after Start New Game.
+    # Uses _can_auto_deal (no weekend restriction) so starting on Sat/Sun works.
+    if st.session_state.pop("auto_deal", False) and _can_auto_deal:
+        _do_deal()
 
     # ─────────────────────────────────────────────────────────────────────────
     # ── Title
     # ─────────────────────────────────────────────────────────────────────────
-    st.markdown(
-        "<h1 style='font-size:2.1rem; font-weight:900; color:#f1f5f9; "
-        "text-transform:uppercase; letter-spacing:0.04em; margin-top:0.4rem; "
-        "margin-bottom:0; text-align:center;'>"
-        "AI Investment Application"
-        "<span style='color:#f59e0b;'> · Paper Trading Simulator</span></h1>",
-        unsafe_allow_html=True,
+    _mode_span = (
+        " · <span style='color:#60a5fa;'>Back Testing Mode</span>"
+        if app_mode == "backtest"
+        else " · <span style='color:#f59e0b;'>Paper Trading Simulator</span>"
     )
+    _left_pad, _title_col, _casino_col, _right_pad = st.columns([2, 14, 1, 2])
+    with _title_col:
+        st.markdown(
+            f"<h1 style='font-size:2.1rem; font-weight:900; color:#f1f5f9; "
+            f"text-transform:uppercase; letter-spacing:0.04em; padding-top:1rem; "
+            f"margin-bottom:0; text-align:center;'>"
+            f"AI Investment Application{_mode_span}"
+            f"</h1>",
+            unsafe_allow_html=True,
+        )
+    with _casino_col:
+        st.markdown("<div style='margin-top:1.4rem;'></div>", unsafe_allow_html=True)
+        with st.popover("🎰", use_container_width=False):
+            render_roulette()
 
     # ─────────────────────────────────────────────────────────────────────────
     # ── Persistent control strip (always visible, cannot be hidden)
     # ─────────────────────────────────────────────────────────────────────────
     st.markdown('<div class="ctrl-top-border"></div>', unsafe_allow_html=True)
 
-    _today     = date.today()
-    _date_part = f"{_ordinal(_today.day)} {_today.strftime('%B %Y')}"
-    if st.session_state["sim_started"] and st.session_state["daily_results"]:
-        _day_label = f"DAY {st.session_state['sim_day_num'] - 1}"
+    # ── Date / day label logic ────────────────────────────────────────────────
+    if app_mode == "backtest":
+        _bt_dates_list = st.session_state.get("sim_dates", [])
+        _bt_idx        = st.session_state.get("sim_date_idx", 0)
+        _card_label    = "📅 Backtest Date"
+        if _bt_idx < len(_bt_dates_list):
+            _bt_next   = pd.Timestamp(_bt_dates_list[_bt_idx])
+            _date_part = _bt_next.strftime("%d %B %Y").lstrip("0")
+        else:
+            _date_part = "Complete"
+        _day_label = (
+            f"BACKTEST · DAY {st.session_state['sim_day_num'] - 1}"
+            if st.session_state.get("daily_results") else "BACKTEST · DAY —"
+        )
+        _card_border = "rgba(96,165,250,0.22)"
+        _card_label_color = "#60a5fa"
     else:
-        _day_label = "DAY —"
+        _today      = date.today()
+        _date_part  = f"{_ordinal(_today.day)} {_today.strftime('%B %Y')}"
+        _card_label = "📅 Trading Date"
+        _day_label  = (
+            f"DAY {st.session_state['sim_day_num'] - 1}"
+            if st.session_state["sim_started"] and st.session_state["daily_results"]
+            else "DAY —"
+        )
+        _card_border      = "rgba(245,158,11,0.22)"
+        _card_label_color = "#f59e0b"
 
-    # ── Row 1: Centered info cards ────────────────────────────────────────────
-    _, c_date, c_deal, _ = st.columns([1, 2, 2, 1])
+    # ── Row 1: Full-width info cards ──────────────────────────────────────────
+    c_date, c_deal = st.columns(2)
 
     with c_date:
         st.markdown(
-            f"<div style='background:rgba(255,255,255,0.03); border:1px solid rgba(245,158,11,0.28); "
-            f"border-radius:12px; padding:0.9rem 1.2rem; text-align:center;'>"
-            f"<div style='font-size:0.58rem; font-weight:800; color:#f59e0b; text-transform:uppercase; "
-            f"letter-spacing:0.18em; margin-bottom:0.45rem;'>📅 Trading Date</div>"
+            f"<div style='background:rgba(255,255,255,0.025); border:1px solid {_card_border}; "
+            f"border-radius:12px; padding:0.85rem 1.2rem; text-align:center; "
+            f"min-height:110px; display:flex; flex-direction:column; justify-content:center;'>"
+            f"<div style='font-size:0.58rem; font-weight:800; color:{_card_label_color}; "
+            f"text-transform:uppercase; letter-spacing:0.18em; margin-bottom:0.45rem;'>{_card_label}</div>"
             f"<div style='font-family:monospace; font-size:1.1rem; font-weight:900; color:#f1f5f9; "
             f"letter-spacing:0.02em;'>{_date_part}</div>"
             f"<div style='font-size:0.65rem; font-weight:700; color:#6b7280; margin-top:0.2rem; "
@@ -1653,100 +2969,60 @@ def main():
         )
 
     with c_deal:
+        _next_move_color = "#60a5fa" if app_mode == "backtest" else "#f59e0b"
+        _next_move_label = "⏱️ Next Step" if app_mode == "backtest" else "📈 Next Move"
+        # CSS: force the bordered container to the same min-height as the left card.
+        # The marker div and stVerticalBlockBorderWrapper are SIBLINGS inside the
+        # column's stVerticalBlock, so we use :has() to scope the selector correctly.
+        st.markdown(
+            "<style>"
+            "[data-testid='stVerticalBlock']:has(.ctrl-right-card) "
+            "[data-testid='stVerticalBlockBorderWrapper']"
+            "{ min-height:110px !important; }"
+            "[data-testid='stVerticalBlock']:has(.ctrl-right-card) "
+            "[data-testid='stVerticalBlockBorderWrapper'] > div"
+            "{ min-height:110px !important; display:flex !important; "
+            "flex-direction:column !important; justify-content:center !important; }"
+            "</style>"
+            "<div class='ctrl-right-card'></div>",
+            unsafe_allow_html=True,
+        )
         with st.container(border=True):
             st.markdown(
-                "<div style='font-size:0.58rem; font-weight:800; color:#f59e0b; "
+                f"<div style='font-size:0.58rem; font-weight:800; color:{_next_move_color}; "
                 "text-transform:uppercase; letter-spacing:0.18em; margin-bottom:0.35rem; "
-                "text-align:center;'>📈 Next Move</div>",
+                f"text-align:center;'>{_next_move_label}</div>",
                 unsafe_allow_html=True,
             )
             if st.session_state["sim_started"] and not dates_remaining:
                 st.success("All hands dealt", icon="🏁")
             else:
-                if already_ran_today and dates_remaining:
+                if app_mode != "backtest" and _is_weekend and dates_remaining:
+                    st.markdown(
+                        "<div style='font-size:0.65rem; color:#f59e0b; font-weight:700; "
+                        "text-align:center; padding-bottom:0.2rem;'>🗓️ Markets closed — try Monday</div>",
+                        unsafe_allow_html=True,
+                    )
+                elif app_mode != "backtest" and already_ran_today and dates_remaining:
                     st.markdown(
                         "<div style='font-size:0.65rem; color:#f59e0b; font-weight:700; "
                         "text-align:center; padding-bottom:0.2rem;'>⏳ Come back tomorrow</div>",
                         unsafe_allow_html=True,
                     )
-                if st.button("📈  Deal Next Hand", disabled=not can_advance,
-                             use_container_width=True):
-                    _deal_next_hand(db)
-
-    # ── Casino section ────────────────────────────────────────────────────────
-    st.markdown(
-        "<div style='display:flex; align-items:center; gap:0.8rem; "
-        "margin:1rem 0 0.6rem;'>"
-        "<div style='flex:1; height:1px; background:linear-gradient(90deg, "
-        "transparent, rgba(245,158,11,0.35));'></div>"
-        "<div style='font-size:0.58rem; font-weight:800; color:#f59e0b; "
-        "text-transform:uppercase; letter-spacing:0.22em; padding:0.2rem 0.75rem; "
-        "border:1px solid rgba(245,158,11,0.3); border-radius:20px; "
-        "background:rgba(245,158,11,0.06);'>🎰 Casino</div>"
-        "<div style='flex:1; height:1px; background:linear-gradient(270deg, "
-        "transparent, rgba(245,158,11,0.35));'></div>"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    _, c_casino, _ = st.columns([2, 3, 2])
-    with c_casino:
-        with st.container(border=True):
-            with st.popover("🎰  Open Roulette Table", use_container_width=True):
-                render_roulette()
-
-    # ── Bottom bar: Start New Game + API status ───────────────────────────────
-    st.markdown('<div class="ctrl-bottom-border" style="margin-top:0.9rem;"></div>',
-                unsafe_allow_html=True)
-
-    c_start, _, c_api = st.columns([2, 3, 2])
-
-    with c_start:
-        if st.button("🎲  Start New Game", type="primary", use_container_width=True):
-            with st.spinner("Fetching fresh S&P 500 data …"):
-                try:
-                    db.reset_all(INITIAL_CAPITAL)
-                    fresh_df = md.fetch_sp500_prices_csv(CSV_PATH)
-                    md.fetch_and_store_sp500(db)
-                    st.cache_data.clear()
-                except Exception as exc:
-                    st.error(f"Failed to fetch market data: {exc}")
-                    st.stop()
-
-            fresh_df.index = pd.to_datetime(fresh_df.index)
-            fresh_df = fresh_df.sort_index()
-            sim_dates = fresh_df.index[-SIMULATION_DAYS:].tolist()
-
-            st.session_state.update({
-                "sim_started":      True,
-                "sim_date_idx":     0,
-                "sim_day_num":      1,
-                "sim_dates":        sim_dates,
-                "daily_results":    [],
-                "sim_capital":      INITIAL_CAPITAL,
-                "sim_strategy":     "Momentum",
-                "report_date":      "",
-                "portfolio_report": None,
-                "pending_day_data": None,
-                "auto_deal":        True,
-            })
-            st.rerun()
-
-    with c_api:
-        if API_KEY:
-            st.success("Claude AI · connected", icon="🤖")
-        else:
-            st.warning("Rule-based mode", icon="⚙️")
+                _btn_label = "⏱️  Next Backtest Day" if app_mode == "backtest" else "📈  Deal Next Hand"
+                if st.button(_btn_label, disabled=not can_advance, use_container_width=True):
+                    _do_deal()
 
     st.markdown('<div class="ctrl-bottom-border"></div>', unsafe_allow_html=True)
 
     # ─────────────────────────────────────────────────────────────────────────
     # ── Main tabs
     # ─────────────────────────────────────────────────────────────────────────
-    tab_summary, tab_portfolio, tab_market = st.tabs([
+    tab_summary, tab_portfolio, tab_market, tab_logs = st.tabs([
         "🗓️  Daily Summary",
         "📊  Portfolio",
         "🌐  Market Data",
+        "🤖  Agent Logs",
     ])
 
     daily_results    = st.session_state["daily_results"]
@@ -1761,7 +3037,53 @@ def main():
         render_portfolio(db, daily_results, init_cap, portfolio_report)
 
     with tab_market:
-        render_market_data(db)
+        if app_mode == "backtest":
+            # backtest DB prices table is already scoped to this backtest window
+            _bt_prices     = load_price_data(db.db_path)
+            _bt_dates_done = st.session_state.get("sim_dates", [])
+            _bt_idx        = st.session_state.get("sim_date_idx", 0)
+            _bt_cutoff     = _bt_dates_done[_bt_idx - 1] if _bt_idx > 0 and _bt_dates_done else None
+            render_market_data(db, bt_prices_df=_bt_prices, bt_cutoff_date=_bt_cutoff)
+        else:
+            render_market_data(db)
+
+    with tab_logs:
+        render_agent_logs()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ── Footer (always at the very bottom of the page)
+    # ─────────────────────────────────────────────────────────────────────────
+    st.markdown('<div class="ctrl-top-border" style="margin-top:2rem;"></div>',
+                unsafe_allow_html=True)
+
+    f_start, f_api = st.columns(2)
+
+    with f_start:
+        if st.button("🎲  Start New Game", type="primary", use_container_width=True):
+            # Already in simulation — reset and go straight to fetching.
+            # To switch modes, refresh the page instead.
+            st.session_state["app_mode"]       = "simulation"
+            st.session_state["new_game_stage"] = "resetting"
+            st.rerun()
+
+    with f_api:
+        if API_KEY:
+            _api_html = (
+                "<div style='background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.35); "
+                "border-radius:6px; padding:0.45rem 1rem; text-align:center; "
+                "font-weight:600; color:#10b981; font-size:0.9rem; width:100%;'>"
+                "🤖&nbsp;&nbsp;Claude AI · connected</div>"
+            )
+        else:
+            _api_html = (
+                "<div style='background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.35); "
+                "border-radius:6px; padding:0.45rem 1rem; text-align:center; "
+                "font-weight:600; color:#f59e0b; font-size:0.9rem; width:100%;'>"
+                "⚙️&nbsp;&nbsp;Rule-based mode</div>"
+            )
+        st.markdown(_api_html, unsafe_allow_html=True)
+
+    st.markdown('<div class="ctrl-bottom-border"></div>', unsafe_allow_html=True)
 
 
 if __name__ == "__main__":

@@ -75,27 +75,33 @@ class StrategyAgent:
         portfolio:    dict,
         current_date: str,
         day_number:   int,
+        feedback:     list[str] | None = None,
     ) -> list[dict]:
         """
         Returns a list of raw trade proposals (before risk validation).
 
-        Tries the Claude API first; falls back to deterministic logic on
-        any failure.
+        feedback : list of violation strings from a prior RiskAgent run.
+                   When provided the agent is asked to revise its picks to
+                   avoid the previously rejected tickers / constraints.
         """
         self.api_failed = False
         self.api_error  = ""
+        _retry = bool(feedback)
 
         # ── Primary: Claude tool-use ──────────────────────────────────────
-        import config as _cfg   # re-read at call time so a late-loaded key is picked up
+        import config as _cfg
         _api_key = _cfg.API_KEY
         _model   = _cfg.MODEL
         if _api_key:
             try:
-                proposals = self._llm_proposals(analysis, portfolio, _api_key, _model)
+                proposals = self._llm_proposals(
+                    analysis, portfolio, _api_key, _model, feedback=feedback
+                )
                 n_sell = sum(1 for p in proposals if p["action"] == "SELL")
                 n_buy  = sum(1 for p in proposals if p["action"] == "BUY")
+                tag = " [REVISED after risk feedback]" if _retry else ""
                 self.reasoning = (
-                    f"[Claude AI] Liquidating {n_sell} position(s); "
+                    f"[Claude AI{tag}] Liquidating {n_sell} position(s); "
                     f"buying {n_buy} high-vol S&P 500 losers (3–5 picks)."
                 )
                 return proposals
@@ -107,18 +113,20 @@ class StrategyAgent:
                 self.api_error  = str(exc)
 
         # ── Fallback: hard-coded deterministic logic ──────────────────────
-        proposals = self._build_proposals(analysis, portfolio)
+        proposals = self._build_proposals(analysis, portfolio, feedback=feedback)
         n_sell = sum(1 for p in proposals if p["action"] == "SELL")
         n_buy  = sum(1 for p in proposals if p["action"] == "BUY")
+        tag = " [REVISED]" if _retry else ""
         self.reasoning = (
-            f"[Deterministic Fallback] Liquidating {n_sell} position(s); "
+            f"[Deterministic Fallback{tag}] Liquidating {n_sell} position(s); "
             f"buying {n_buy} highest-vol S&P 500 losers (RSI-gated 3–5 picks)."
         )
         return proposals
 
     # ── LLM path (Claude tool use) ────────────────────────────────────────────
 
-    def _llm_proposals(self, analysis: dict, portfolio: dict, api_key: str, model: str) -> list[dict]:
+    def _llm_proposals(self, analysis: dict, portfolio: dict, api_key: str, model: str,
+                       feedback: list[str] | None = None) -> list[dict]:
         """
         Ask Claude to propose trades via the `submit_trade_proposals` tool.
 
@@ -191,6 +199,17 @@ class StrategyAgent:
             "  e) Call `submit_trade_proposals` with your complete trade list."
         )
 
+        feedback_block = ""
+        if feedback:
+            feedback_block = (
+                "\n\nRISK AGENT FEEDBACK — YOUR PREVIOUS PROPOSALS WERE REJECTED\n"
+                "──────────────────────────────────────────────────────────────\n"
+                + "\n".join(f"  • {v}" for v in feedback)
+                + "\n\nYou MUST avoid the tickers/actions flagged above and propose "
+                "alternative picks that satisfy all constraints (cash ≥ 0, "
+                "max position ≤ 40 %, max 2 trades/day)."
+            )
+
         user_msg = (
             f"TODAY'S REBALANCE\n"
             f"─────────────────\n"
@@ -201,7 +220,8 @@ class StrategyAgent:
             f"TOP-50 S&P 500 STOCKS BY 5-DAY REALISED VOLATILITY\n"
             f"(sorted by previous-day return — most negative first)\n"
             f"────────────────────────────────────────────────────\n"
-            f"{universe_lines}\n\n"
+            f"{universe_lines}"
+            f"{feedback_block}\n\n"
             "Step through the rules: identify the 3–5 worst losers from this "
             "high-vol universe, decide how many to buy based on signal conviction, "
             "then call `submit_trade_proposals` with your full trade list."
@@ -284,6 +304,7 @@ class StrategyAgent:
         self,
         analysis:  dict[str, dict],
         portfolio: dict,
+        feedback:  list[str] | None = None,
     ) -> list[dict]:
         proposals: list[dict] = []
         total     = portfolio["total_value"]
@@ -299,9 +320,18 @@ class StrategyAgent:
                 "reasoning":        "Full liquidation before daily rebalance.",
             })
 
+        # Extract tickers previously rejected by the Risk Agent so we skip them
+        rejected_tickers: set[str] = set()
+        if feedback:
+            import re as _re
+            for msg in feedback:
+                m = _re.match(r"REJECTED (\w+)", msg)
+                if m:
+                    rejected_tickers.add(m.group(1))
+
         # Step 2: rank S&P 500 universe by 5-day realised volatility
         vol_ranked = sorted(
-            analysis.items(),
+            ((k, v) for k, v in analysis.items() if k not in rejected_tickers),
             key=lambda kv: kv[1].get("realized_vol_5d", 0.0),
             reverse=True,
         )

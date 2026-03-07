@@ -383,6 +383,7 @@ Write a concise 3-paragraph briefing. Strict formatting rules:
 - NEVER use markdown headers (no #, ##, ###)
 - NO bullet points or dashes
 - NO backtick code spans (never wrap numbers or words in backticks)
+- NO dollar signs ($) — write amounts as e.g. "USD 248,749" or "248k" to avoid rendering conflicts
 - Each paragraph: 2–3 sentences maximum
 - Start each paragraph with an inline bold label exactly as written below
 
