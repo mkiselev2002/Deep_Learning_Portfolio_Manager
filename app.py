@@ -2353,7 +2353,7 @@ def _start_backtest_with_loading(db: "PortfolioDatabase") -> None:
 
     if _needs_fetch:
         fetch_start = (start_ts - pd.Timedelta(days=100)).strftime("%Y-%m-%d")
-        fetch_end   = (end_ts   + pd.Timedelta(days=5)).strftime("%Y-%m-%d")
+        fetch_end   = (end_ts   + pd.Timedelta(days=15)).strftime("%Y-%m-%d")
         st.markdown(_loading_overlay(
             "Setting Up Backtest",
             f"Fetching S&amp;P 500 data for {start_ts.strftime('%b %Y')}&hellip;",
