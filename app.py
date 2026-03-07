@@ -2328,18 +2328,38 @@ header,[data-testid="stToolbar"],[data-testid="stDecoration"]{display:none!impor
 def _start_backtest_with_loading(db: "PortfolioDatabase") -> None:
     """Reset the backtest DB and configure session state for back-testing."""
 
-    # Ensure the simulation DB has full price history first
     _BT_WINDOW     = 14  # calendar days per backtest game
     start_date_str = st.session_state.get("bt_start_date", "")
-    sim_db = PortfolioDatabase(DB_PATH)
+    sim_db         = PortfolioDatabase(DB_PATH)
 
-    if not sim_db.has_prices():
+    # ── Validate start date ──────────────────────────────────────────────────
+    start_ts = pd.Timestamp(start_date_str) if start_date_str else None
+    if start_ts is None:
+        st.session_state["new_game_stage"]  = "bt_setup"
+        st.session_state["_new_game_error"] = "No backtest start date set."
+        st.rerun()
+        return
+
+    end_ts       = start_ts + pd.Timedelta(days=_BT_WINDOW - 1)
+    buffer_start = start_ts - pd.Timedelta(days=100)  # ~70 trading-day lookback
+
+    # ── Smart fetch: only download if sim_db doesn't cover the needed window ─
+    _min_dt, _max_dt = sim_db.get_prices_date_range()
+    _needs_fetch = (
+        _min_dt is None                                     # no data at all
+        or _max_dt < end_ts                                 # data ends before window
+        or _min_dt > buffer_start + pd.Timedelta(days=15)  # not enough lookback
+    )
+
+    if _needs_fetch:
+        fetch_start = (start_ts - pd.Timedelta(days=100)).strftime("%Y-%m-%d")
+        fetch_end   = (end_ts   + pd.Timedelta(days=5)).strftime("%Y-%m-%d")
         st.markdown(_loading_overlay(
             "Setting Up Backtest",
-            "Fetching S&P 500 history since 2019 &mdash; this takes about a minute&hellip;",
+            f"Fetching S&amp;P 500 data for {start_ts.strftime('%b %Y')}&hellip;",
         ), unsafe_allow_html=True)
         try:
-            md.fetch_and_store_prices(sim_db, start="2019-01-01")
+            md.fetch_and_store_prices(sim_db, start=fetch_start, end=fetch_end)
             st.cache_data.clear()
         except Exception as exc:
             st.session_state["new_game_stage"]  = "bt_setup"
@@ -2350,6 +2370,7 @@ def _start_backtest_with_loading(db: "PortfolioDatabase") -> None:
         st.markdown(_loading_overlay("Setting Up Backtest", "Preparing historical data&hellip;"),
                     unsafe_allow_html=True)
 
+    # ── Reset backtest DB ────────────────────────────────────────────────────
     try:
         db.reset_all(INITIAL_CAPITAL)
         st.cache_data.clear()
@@ -2359,15 +2380,8 @@ def _start_backtest_with_loading(db: "PortfolioDatabase") -> None:
         st.rerun()
         return
 
+    # ── Copy relevant price window into backtest DB ──────────────────────────
     try:
-        start_ts = pd.Timestamp(start_date_str) if start_date_str else None
-        if start_ts is None:
-            raise ValueError("No backtest start date set.")
-
-        end_ts       = start_ts + pd.Timedelta(days=_BT_WINDOW - 1)
-        buffer_start = start_ts - pd.Timedelta(days=90)  # ~60 trading-day lookback
-
-        # Copy the relevant window from simulation DB into backtest DB
         prices_window = sim_db.load_prices(cutoff_date=end_ts)
         if not prices_window.empty:
             prices_window = prices_window[prices_window.index >= buffer_start]

@@ -136,54 +136,63 @@ def fetch_today_prices(tickers: list[str]) -> pd.DataFrame:
 def fetch_and_store_prices(
     db,
     start: str | None = None,
-    period: str = "60d",
+    end: str | None = None,
+    period: str = "90d",
+    batch_size: int = 100,
 ) -> pd.DataFrame:
     """
     Fetch S&P 500 close prices from Yahoo Finance and upsert into db.prices.
 
-    `start` (e.g. "2019-01-01") fetches full history from that date.
-    `period` (e.g. "60d") is used when no start date is given.
+    `start` / `end`  – explicit date range (YYYY-MM-DD strings).
+    `period`          – rolling window used when start is None (e.g. "90d").
+    `batch_size`      – tickers per yfinance call; keeps memory usage low.
 
+    Downloads in batches so a single 500-ticker call never blows RAM.
     Existing rows are upserted (INSERT OR REPLACE), so incremental calls
-    are safe.  Returns the wide-format close-price DataFrame.
-
-    Raises ValueError if yfinance returns no data.
+    are safe.  Returns the full wide-format close-price DataFrame from db.
     """
     constituents = get_sp500_constituents()
-    tickers = constituents["symbol"].tolist()
+    tickers      = constituents["symbol"].tolist()
+    total_saved  = 0
 
-    if start is not None:
-        raw = yf.download(
-            tickers, start=start, interval="1d",
-            auto_adjust=True, progress=False, threads=True,
-        )
-    else:
-        raw = yf.download(
-            tickers, period=period, interval="1d",
-            auto_adjust=True, progress=False, threads=True,
-        )
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i: i + batch_size]
 
-    if raw.empty:
+        if start is not None:
+            dl_kwargs: dict = dict(
+                start=start, interval="1d",
+                auto_adjust=True, progress=False, threads=True,
+            )
+            if end is not None:
+                dl_kwargs["end"] = end
+        else:
+            dl_kwargs = dict(
+                period=period, interval="1d",
+                auto_adjust=True, progress=False, threads=True,
+            )
+
+        raw = yf.download(batch, **dl_kwargs)
+        if raw.empty:
+            del raw
+            continue
+
+        close_batch = (
+            raw["Close"].copy()
+            if isinstance(raw.columns, pd.MultiIndex)
+            else raw.copy()
+        )
+        close_batch = close_batch.dropna(how="all")
+        close_batch.index.name = "Date"
+
+        db.upsert_prices(close_batch)
+        total_saved += len(close_batch.columns)
+        del raw, close_batch   # free memory before next batch
+
+    if total_saved == 0:
         raise ValueError("yfinance returned no price data for S&P 500 tickers.")
 
-    close_df = raw["Close"].copy() if isinstance(raw.columns, pd.MultiIndex) else raw.copy()
-
-    # Drop entirely-empty rows; drop tickers with >20 % missing values
-    close_df = close_df.dropna(how="all")
-    min_rows = int(len(close_df) * 0.80)
-    before   = len(close_df.columns)
-    close_df = close_df.dropna(axis=1, thresh=min_rows)
-    close_df = close_df.dropna(how="all")
-    dropped  = before - len(close_df.columns)
-    close_df.index.name = "Date"
-
-    logger.info(
-        "fetch_and_store_prices: %d tickers downloaded, %d dropped (insufficient data).",
-        len(close_df.columns), dropped,
-    )
-
-    db.upsert_prices(close_df)
-    return close_df
+    logger.info("fetch_and_store_prices: %d ticker-columns saved.", total_saved)
+    return db.load_prices()
 
 
 def refresh_latest_prices(db) -> pd.DataFrame:
@@ -197,11 +206,11 @@ def refresh_latest_prices(db) -> pd.DataFrame:
     _, max_dt = db.get_prices_date_range()
 
     if max_dt is None:
-        return fetch_and_store_prices(db, start="2019-01-01")
+        return fetch_and_store_prices(db, period="90d")
 
     tickers = db.get_prices_symbols()
     if not tickers:
-        return fetch_and_store_prices(db, start="2019-01-01")
+        return fetch_and_store_prices(db, period="90d")
 
     raw = yf.download(
         tickers, period="5d", interval="1d",
