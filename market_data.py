@@ -137,53 +137,67 @@ def fetch_and_store_prices(
     db,
     start: str | None = None,
     period: str = "60d",
+    batch_size: int = 50,
 ) -> pd.DataFrame:
     """
     Fetch S&P 500 close prices from Yahoo Finance and upsert into db.prices.
 
-    `start` (e.g. "2019-01-01") fetches full history from that date.
-    `period` (e.g. "60d") is used when no start date is given.
+    Downloads in batches of `batch_size` tickers to keep peak memory low —
+    each batch is upserted to SQLite and discarded before the next is fetched.
+
+    `start` (e.g. "2024-01-01") fetches history from that date.
+    `period` (e.g. "90d") is used when no start date is given.
 
     Existing rows are upserted (INSERT OR REPLACE), so incremental calls
-    are safe.  Returns the wide-format close-price DataFrame.
+    are safe.  Returns the full wide-format close-price DataFrame from DB.
 
-    Raises ValueError if yfinance returns no data.
+    Raises ValueError if yfinance returns no data for any batch.
     """
     constituents = get_sp500_constituents()
     tickers = constituents["symbol"].tolist()
 
-    if start is not None:
-        raw = yf.download(
-            tickers, start=start, interval="1d",
-            auto_adjust=True, progress=False, threads=True,
-        )
-    else:
-        raw = yf.download(
-            tickers, period=period, interval="1d",
-            auto_adjust=True, progress=False, threads=True,
-        )
+    total_stored = 0
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i: i + batch_size]
+        try:
+            if start is not None:
+                raw = yf.download(
+                    batch, start=start, interval="1d",
+                    auto_adjust=True, progress=False, threads=False,
+                )
+            else:
+                raw = yf.download(
+                    batch, period=period, interval="1d",
+                    auto_adjust=True, progress=False, threads=False,
+                )
+        except Exception as exc:
+            logger.warning("fetch_and_store_prices: batch %d–%d failed (%s), skipping.",
+                           i, i + batch_size, exc)
+            continue
 
-    if raw.empty:
-        raise ValueError("yfinance returned no price data for S&P 500 tickers.")
+        if raw.empty:
+            logger.warning("fetch_and_store_prices: empty response for batch %d–%d.", i, i + batch_size)
+            continue
 
-    close_df = raw["Close"].copy() if isinstance(raw.columns, pd.MultiIndex) else raw.copy()
+        close_df = raw["Close"].copy() if isinstance(raw.columns, pd.MultiIndex) else raw.copy()
+        close_df = close_df.dropna(how="all")
+        if close_df.empty:
+            continue
 
-    # Drop entirely-empty rows; drop tickers with >20 % missing values
-    close_df = close_df.dropna(how="all")
-    min_rows = int(len(close_df) * 0.80)
-    before   = len(close_df.columns)
-    close_df = close_df.dropna(axis=1, thresh=min_rows)
-    close_df = close_df.dropna(how="all")
-    dropped  = before - len(close_df.columns)
-    close_df.index.name = "Date"
+        min_rows = int(len(close_df) * 0.80)
+        close_df = close_df.dropna(axis=1, thresh=min_rows)
+        close_df = close_df.dropna(how="all")
+        close_df.index.name = "Date"
 
-    logger.info(
-        "fetch_and_store_prices: %d tickers downloaded, %d dropped (insufficient data).",
-        len(close_df.columns), dropped,
-    )
+        db.upsert_prices(close_df)
+        total_stored += len(close_df.columns)
+        del raw, close_df   # free memory before next batch
 
-    db.upsert_prices(close_df)
-    return close_df
+    if total_stored == 0:
+        raise ValueError("yfinance returned no price data for any S&P 500 tickers.")
+
+    logger.info("fetch_and_store_prices: stored prices for %d tickers.", total_stored)
+    return db.load_prices()
 
 
 def refresh_latest_prices(db) -> pd.DataFrame:
