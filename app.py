@@ -2871,18 +2871,32 @@ def main():
         _card_label_color = "#f59e0b"
 
     # ── Row 1: Full-width info cards ──────────────────────────────────────────
+    # Force the columns row to stretch so both cards share the same height.
+    st.markdown(
+        "<style>"
+        ".ctrl-cards-row [data-testid='stHorizontalBlock']"
+        "{ align-items:stretch !important; }"
+        ".ctrl-cards-row [data-testid='stColumn']"
+        "{ display:flex !important; flex-direction:column !important; }"
+        ".ctrl-cards-row [data-testid='stColumn'] > [data-testid='stVerticalBlock']"
+        "{ flex:1 !important; display:flex !important; flex-direction:column !important; }"
+        "</style>"
+        "<div class='ctrl-cards-row'>",
+        unsafe_allow_html=True,
+    )
     c_date, c_deal = st.columns(2)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     with c_date:
         st.markdown(
             f"<div style='background:rgba(255,255,255,0.025); border:1px solid {_card_border}; "
-            f"border-radius:12px; padding:0.85rem 1.2rem; text-align:center; "
-            f"min-height:110px; display:flex; flex-direction:column; justify-content:center;'>"
+            f"border-radius:12px; padding:0.4rem 1.2rem; text-align:center; "
+            f"display:flex; flex-direction:column; justify-content:center; height:100%;'>"
             f"<div style='font-size:0.58rem; font-weight:800; color:{_card_label_color}; "
-            f"text-transform:uppercase; letter-spacing:0.18em; margin-bottom:0.45rem;'>{_card_label}</div>"
+            f"text-transform:uppercase; letter-spacing:0.18em; margin-bottom:0.3rem;'>{_card_label}</div>"
             f"<div style='font-family:monospace; font-size:1.1rem; font-weight:900; color:#f1f5f9; "
             f"letter-spacing:0.02em;'>{_date_part}</div>"
-            f"<div style='font-size:0.65rem; font-weight:700; color:#6b7280; margin-top:0.2rem; "
+            f"<div style='font-size:0.65rem; font-weight:700; color:#6b7280; margin-top:0.15rem; "
             f"text-transform:uppercase; letter-spacing:0.12em;'>{_day_label}</div>"
             f"</div>",
             unsafe_allow_html=True,
@@ -2891,18 +2905,17 @@ def main():
     with c_deal:
         _next_move_color = "#60a5fa" if app_mode == "backtest" else "#f59e0b"
         _next_move_label = "⏱️ Next Step" if app_mode == "backtest" else "📈 Next Move"
-        # CSS: force the bordered container to the same min-height as the left card.
-        # The marker div and stVerticalBlockBorderWrapper are SIBLINGS inside the
-        # column's stVerticalBlock, so we use :has() to scope the selector correctly.
+        # Override padding on this card to match the compact left card,
+        # and make it stretch to full column height.
         st.markdown(
             "<style>"
             "[data-testid='stVerticalBlock']:has(.ctrl-right-card) "
             "[data-testid='stVerticalBlockBorderWrapper']"
-            "{ min-height:110px !important; }"
+            "{ padding: 0.4rem 0.8rem !important; height:100% !important; }"
             "[data-testid='stVerticalBlock']:has(.ctrl-right-card) "
             "[data-testid='stVerticalBlockBorderWrapper'] > div"
-            "{ min-height:110px !important; display:flex !important; "
-            "flex-direction:column !important; justify-content:center !important; }"
+            "{ display:flex !important; flex-direction:column !important; "
+            "justify-content:center !important; height:100% !important; }"
             "</style>"
             "<div class='ctrl-right-card'></div>",
             unsafe_allow_html=True,
