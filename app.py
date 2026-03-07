@@ -36,6 +36,46 @@ import market_data as md
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Per-session backtest DB helpers (isolation between concurrent users)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import uuid as _uuid
+import pathlib as _pathlib
+import time as _time_mod
+
+
+def _get_session_backtest_db_path() -> str:
+    """
+    Return a browser-session-scoped backtest DB path.
+
+    Each Streamlit browser session gets its own backtest_<id>.db so that
+    concurrent users backtesting different date windows don't overwrite
+    each other's data.  The path is created once per session and stored
+    in st.session_state so the same file is reused across reruns.
+    """
+    if "backtest_db_path" not in st.session_state:
+        _sid = _uuid.uuid4().hex[:10]
+        _parent = _pathlib.Path(BACKTEST_DB_PATH).parent
+        st.session_state["backtest_db_path"] = str(_parent / f"backtest_{_sid}.db")
+    return st.session_state["backtest_db_path"]
+
+
+def _cleanup_old_backtest_dbs(max_age_hours: int = 4) -> None:
+    """Delete per-session backtest_*.db files older than max_age_hours."""
+    _parent  = _pathlib.Path(BACKTEST_DB_PATH).parent
+    _cutoff  = _time_mod.time() - max_age_hours * 3600
+    _own     = st.session_state.get("backtest_db_path", "")
+    for _f in _parent.glob("backtest_*.db"):
+        if str(_f) == _own:
+            continue  # never delete this session's own DB
+        try:
+            if _f.stat().st_mtime < _cutoff:
+                _f.unlink()
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Page config & theme
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -264,7 +304,7 @@ def _sync_sim_prices(sim_db: "PortfolioDatabase") -> "pd.DataFrame":
         return sim_db.load_prices()
 
     # sim_db is empty — try to seed it from the backtest DB first
-    bt_db = PortfolioDatabase(BACKTEST_DB_PATH)
+    bt_db = PortfolioDatabase(_get_session_backtest_db_path())
     if bt_db.has_prices():
         bt_prices = bt_db.load_prices()
         if not bt_prices.empty:
@@ -1908,7 +1948,7 @@ def _log_agent(entry: dict) -> None:
     entry.setdefault("ts", _dt.datetime.now().strftime("%H:%M:%S"))
     st.session_state.setdefault("agent_logs", []).append(entry)
     try:
-        _db_path = (BACKTEST_DB_PATH
+        _db_path = (_get_session_backtest_db_path()
                     if st.session_state.get("app_mode") == "backtest"
                     else DB_PATH)
         PortfolioDatabase(_db_path).save_agent_log(entry)
@@ -2849,6 +2889,7 @@ def main():
     # user straight to the mode-select screen with prices ready.
     if "app_initialized" not in st.session_state:
         st.session_state["app_initialized"] = True
+        _cleanup_old_backtest_dbs()   # prune stale per-session DBs (once per session)
         _show_loading_screen()
         _ensure_price_history()   # fetch/refresh while the splash is visible
         st.rerun()
@@ -2856,7 +2897,9 @@ def main():
 
     # ── Choose DB based on mode (defaults to simulation) ─────────────────────
     app_mode = st.session_state.get("app_mode", "simulation")
-    db = PortfolioDatabase(BACKTEST_DB_PATH if app_mode == "backtest" else DB_PATH)
+    db = PortfolioDatabase(
+        _get_session_backtest_db_path() if app_mode == "backtest" else DB_PATH
+    )
 
     # ── Restore simulation state from DB on fresh page load ──────────────────
     # Must run BEFORE the defaults loop so restored keys are not overwritten.
