@@ -189,7 +189,7 @@ def fetch_and_store_prices(
 def refresh_latest_prices(db) -> pd.DataFrame:
     """
     Append any trading days newer than the last date already in db.prices.
-    Falls back to a full fetch from 2019 if the table is empty.
+    Falls back to a 90-day fetch if the table is empty.
 
     Call this before each simulation step so prices are always current.
     Returns the full updated wide-format DataFrame.
@@ -197,11 +197,11 @@ def refresh_latest_prices(db) -> pd.DataFrame:
     _, max_dt = db.get_prices_date_range()
 
     if max_dt is None:
-        return fetch_and_store_prices(db, start="2019-01-01")
+        return fetch_and_store_prices(db, period="90d")
 
     tickers = db.get_prices_symbols()
     if not tickers:
-        return fetch_and_store_prices(db, start="2019-01-01")
+        return fetch_and_store_prices(db, period="90d")
 
     raw = yf.download(
         tickers, period="5d", interval="1d",

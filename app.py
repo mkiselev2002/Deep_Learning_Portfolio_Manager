@@ -248,7 +248,7 @@ def _sync_sim_prices(sim_db: "PortfolioDatabase") -> "pd.DataFrame":
     Priority:
       1. sim_db already current      → incremental top-up only (seconds)
       2. sim_db empty, backtest_db has data → copy + incremental top-up
-      3. Both empty                  → full yfinance fetch from 2019 (one-time)
+      3. Both empty                  → 90-day yfinance fetch (enough for all indicators)
 
     Returns the full prices DataFrame stored in sim_db.
     """
@@ -277,9 +277,9 @@ def _sync_sim_prices(sim_db: "PortfolioDatabase") -> "pd.DataFrame":
             # Top-up with any dates newer than what the backtest DB had
             return md.refresh_latest_prices(sim_db)
 
-    # Nothing anywhere — full historical fetch (only happens once ever)
-    logger.info("_sync_sim_prices: no cached prices found — fetching from 2019.")
-    return md.fetch_and_store_prices(sim_db, start="2019-01-01")
+    # Nothing anywhere — fetch last 90 days (enough for all indicators)
+    logger.info("_sync_sim_prices: no cached prices found — fetching last 90 days.")
+    return md.fetch_and_store_prices(sim_db, period="90d")
 
 
 def _ensure_price_history() -> None:
