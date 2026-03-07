@@ -80,46 +80,24 @@ class StrategyAgent:
         """
         Returns a list of raw trade proposals (before risk validation).
 
+        Stock selection is always deterministic (top-50 vol → worst prev-day
+        losers, skipping already-held tickers) so backtests are reproducible.
+        The LLM is no longer used for stock selection.
+
         feedback : list of violation strings from a prior RiskAgent run.
-                   When provided the agent is asked to revise its picks to
-                   avoid the previously rejected tickers / constraints.
         """
         self.api_failed = False
         self.api_error  = ""
         _retry = bool(feedback)
 
-        # ── Primary: Claude tool-use ──────────────────────────────────────
-        import config as _cfg
-        _api_key = _cfg.API_KEY
-        _model   = _cfg.MODEL
-        if _api_key:
-            try:
-                proposals = self._llm_proposals(
-                    analysis, portfolio, _api_key, _model, feedback=feedback
-                )
-                n_sell = sum(1 for p in proposals if p["action"] == "SELL")
-                n_buy  = sum(1 for p in proposals if p["action"] == "BUY")
-                tag = " [REVISED after risk feedback]" if _retry else ""
-                self.reasoning = (
-                    f"[Claude AI{tag}] Liquidating {n_sell} position(s); "
-                    f"buying {n_buy} high-vol S&P 500 losers (3–5 picks)."
-                )
-                return proposals
-            except Exception as exc:
-                logger.warning(
-                    "LLM strategy failed (%s) — using deterministic fallback.", exc
-                )
-                self.api_failed = True
-                self.api_error  = str(exc)
-
-        # ── Fallback: hard-coded deterministic logic ──────────────────────
         proposals = self._build_proposals(analysis, portfolio, feedback=feedback)
         n_sell = sum(1 for p in proposals if p["action"] == "SELL")
         n_buy  = sum(1 for p in proposals if p["action"] == "BUY")
         tag = " [REVISED]" if _retry else ""
         self.reasoning = (
-            f"[Deterministic Fallback{tag}] Liquidating {n_sell} position(s); "
-            f"buying {n_buy} highest-vol S&P 500 losers (RSI-gated 3–5 picks)."
+            f"[Algo{tag}] Liquidating {n_sell} position(s); "
+            f"buying {n_buy} highest-vol S&P 500 losers (RSI-gated 3–5 picks, "
+            f"skipping already-held tickers)."
         )
         return proposals
 
@@ -329,9 +307,15 @@ class StrategyAgent:
                 if m:
                     rejected_tickers.add(m.group(1))
 
+        # Tickers currently held — do not re-enter a position just liquidated.
+        held_tickers: set[str] = set(positions.keys())
+
         # Step 2: rank S&P 500 universe by 5-day realised volatility
         vol_ranked = sorted(
-            ((k, v) for k, v in analysis.items() if k not in rejected_tickers),
+            (
+                (k, v) for k, v in analysis.items()
+                if k not in rejected_tickers and k not in held_tickers
+            ),
             key=lambda kv: kv[1].get("realized_vol_5d", 0.0),
             reverse=True,
         )
