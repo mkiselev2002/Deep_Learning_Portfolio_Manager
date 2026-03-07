@@ -60,5 +60,10 @@ RSI_WINDOW: int = 14
 LOOKBACK_DAYS: int = 30                      # minimum history needed
 
 # ─── Paths ─────────────────────────────────────────────────────────────────
-DB_PATH          = str(_PROJECT_ROOT / "portfolio.db")
-BACKTEST_DB_PATH = str(_PROJECT_ROOT / "backtest.db")
+# DATA_DIR can be overridden via env var so Railway (or any host) can point
+# the databases at a persistent volume (e.g. /data) instead of the repo root.
+_DATA_DIR = Path(os.environ.get("DATA_DIR", str(_PROJECT_ROOT)))
+Path(_DATA_DIR).mkdir(parents=True, exist_ok=True)
+
+DB_PATH          = str(Path(_DATA_DIR) / "portfolio.db")
+BACKTEST_DB_PATH = str(Path(_DATA_DIR) / "backtest.db")
