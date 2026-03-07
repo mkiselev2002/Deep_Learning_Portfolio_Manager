@@ -2280,12 +2280,13 @@ header,[data-testid="stToolbar"],[data-testid="stDecoration"]{display:none!impor
         if selected_date != _raw_date:
             st.caption(f"⚠️ Clamped to allowed range: {selected_date}")
 
-        # 14-calendar-day window from selected start
-        _start_ts = pd.Timestamp(selected_date)
-        _end_ts   = _start_ts + pd.Timedelta(days=_BT_WINDOW - 1)
-        bt_dates  = [d for d in all_dates if _start_ts <= d <= _end_ts]
-        n_days    = len(bt_dates)
-        end_label = _end_ts.strftime("%b %d, %Y")
+        # Pick the first SIMULATION_DAYS trading days from selected start
+        _start_ts         = pd.Timestamp(selected_date)
+        _trading_from_start = sorted([d for d in all_dates if d >= _start_ts])
+        bt_dates          = _trading_from_start[:SIMULATION_DAYS]
+        n_days            = len(bt_dates)
+        end_label         = bt_dates[-1].strftime("%b %d, %Y") if bt_dates else (
+            _start_ts + pd.Timedelta(days=_BT_WINDOW - 1)).strftime("%b %d, %Y")
 
         _no_data = n_days == 0
         if _no_data:
@@ -2299,7 +2300,7 @@ header,[data-testid="stToolbar"],[data-testid="stDecoration"]{display:none!impor
   <div style="font-size:0.6rem;text-transform:uppercase;letter-spacing:0.1em;
               color:#4b5563;margin-top:3px;">This takes ~1 min the first time</div>
   <div style="font-size:0.65rem;color:#374151;margin-top:8px;">
-    14-day window: {selected_date.strftime("%b %d, %Y")} → {end_label}
+    {SIMULATION_DAYS} trading days from {selected_date.strftime("%b %d, %Y")}
   </div>
 </div>""", unsafe_allow_html=True)
         else:
@@ -2310,7 +2311,7 @@ header,[data-testid="stToolbar"],[data-testid="stDecoration"]{display:none!impor
   <div style="font-size:0.6rem;text-transform:uppercase;letter-spacing:0.12em;
               color:#6b7280;margin-top:3px;">Trading days in this window</div>
   <div style="font-size:0.65rem;color:#4b5563;margin-top:8px;">
-    14-day window: {selected_date.strftime("%b %d, %Y")} → {end_label}
+    {selected_date.strftime("%b %d, %Y")} → {end_label}
   </div>
 </div>""", unsafe_allow_html=True)
 
@@ -2328,7 +2329,7 @@ header,[data-testid="stToolbar"],[data-testid="stDecoration"]{display:none!impor
 def _start_backtest_with_loading(db: "PortfolioDatabase") -> None:
     """Reset the backtest DB and configure session state for back-testing."""
 
-    _BT_WINDOW     = 14  # calendar days per backtest game
+    _BT_WINDOW     = 21  # calendar-day ceiling — guarantees 10+ trading days
     start_date_str = st.session_state.get("bt_start_date", "")
     sim_db         = PortfolioDatabase(DB_PATH)
 
@@ -2387,7 +2388,8 @@ def _start_backtest_with_loading(db: "PortfolioDatabase") -> None:
             prices_window = prices_window[prices_window.index >= buffer_start]
             db.upsert_prices(prices_window)
 
-        bt_dates = [d for d in prices_window.index if start_ts <= d <= end_ts]
+        # Take exactly SIMULATION_DAYS trading days starting from start_ts
+        bt_dates = sorted([d for d in prices_window.index if d >= start_ts])[:SIMULATION_DAYS]
     except Exception as exc:
         st.session_state["new_game_stage"]  = "bt_setup"
         st.session_state["_new_game_error"] = f"Price data load failed: {exc}"
