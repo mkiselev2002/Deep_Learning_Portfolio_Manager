@@ -2440,17 +2440,25 @@ def _start_backtest_with_loading(db: "PortfolioDatabase") -> None:
     end_ts       = start_ts + pd.Timedelta(days=_BT_WINDOW - 1)
     buffer_start = start_ts - pd.Timedelta(days=100)  # ~70 trading-day lookback
 
-    # ── Smart fetch: only download if sim_db doesn't cover the needed window ─
-    _min_dt, _max_dt = sim_db.get_prices_date_range()
-    _needs_fetch = (
-        _min_dt is None                                     # no data at all
-        or _max_dt < end_ts                                 # data ends before window
-        or _min_dt > buffer_start + pd.Timedelta(days=15)  # not enough lookback
-    )
+    fetch_start = (start_ts - pd.Timedelta(days=100)).strftime("%Y-%m-%d")
+    fetch_end   = (end_ts   + pd.Timedelta(days=15)).strftime("%Y-%m-%d")
+
+    # ── Smart fetch: directly check the actual window, not just overall range ─
+    # Using min/max of the whole DB is unreliable — portfolio.db can have gaps
+    # (e.g. 2019-2020 data from one backtest + 2025-present from live sim),
+    # so a 2022 request would see _min_dt=2019 and skip the fetch even though
+    # 2022 data is absent.  Instead, load what we have for this window first
+    # and only fetch if there aren't enough trading days.
+    try:
+        _probe = sim_db.load_prices(cutoff_date=end_ts)
+        if not _probe.empty:
+            _probe = _probe[_probe.index >= buffer_start]
+        _available = sorted([d for d in _probe.index if d >= start_ts])
+        _needs_fetch = len(_available) < SIMULATION_DAYS
+    except Exception:
+        _needs_fetch = True
 
     if _needs_fetch:
-        fetch_start = (start_ts - pd.Timedelta(days=100)).strftime("%Y-%m-%d")
-        fetch_end   = (end_ts   + pd.Timedelta(days=15)).strftime("%Y-%m-%d")
         st.markdown(_loading_overlay(
             "Setting Up Backtest",
             f"Fetching S&amp;P 500 data for {start_ts.strftime('%b %Y')}&hellip;",
