@@ -2919,10 +2919,11 @@ def main():
     # ─────────────────────────────────────────────────────────────────────────
     # ── Main tabs
     # ─────────────────────────────────────────────────────────────────────────
-    tab_summary, tab_portfolio, tab_market = st.tabs([
+    tab_summary, tab_portfolio, tab_market, tab_logs = st.tabs([
         "🗓️  Daily Summary",
         "📊  Portfolio",
         "🌐  Market Data",
+        "🤖  Agent Logs",
     ])
 
     daily_results    = st.session_state["daily_results"]
@@ -2946,6 +2947,9 @@ def main():
             render_market_data(db, bt_prices_df=_bt_prices, bt_cutoff_date=_bt_cutoff)
         else:
             render_market_data(db)
+
+    with tab_logs:
+        render_agent_logs()
 
     # ─────────────────────────────────────────────────────────────────────────
     # ── Footer (always at the very bottom of the page)
