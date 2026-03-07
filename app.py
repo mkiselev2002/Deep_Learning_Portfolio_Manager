@@ -1986,6 +1986,22 @@ def _deal_next_hand(
                 analysis, portfolio, date_str, day_num, feedback=feedback
             )
 
+        # Safety net: Claude sometimes omits a liquidation. Inject a SELL for
+        # every currently-held position that didn't get one, so full liquidation
+        # is always enforced regardless of what the LLM returned.
+        _proposed_sell_tickers = {
+            p["ticker"] for p in proposed if p["action"] == "SELL"
+        }
+        _total_val = portfolio.get("total_value", 1)
+        for _sym, _pos in portfolio.get("positions", {}).items():
+            if _sym not in _proposed_sell_tickers:
+                proposed.insert(0, {
+                    "ticker":           _sym,
+                    "action":           "SELL",
+                    "pct_of_portfolio": round(_pos["value"] / _total_val * 100),
+                    "reasoning":        "Full liquidation before daily rebalance.",
+                })
+
         n_sell = sum(1 for p in proposed if p["action"] == "SELL")
         n_buy  = sum(1 for p in proposed if p["action"] == "BUY")
         _log_agent({
