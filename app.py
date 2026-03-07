@@ -2939,12 +2939,18 @@ def main():
 
     with tab_market:
         if app_mode == "backtest":
-            # backtest DB prices table is already scoped to this backtest window
             _bt_prices     = load_price_data(db.db_path)
             _bt_dates_done = st.session_state.get("sim_dates", [])
             _bt_idx        = st.session_state.get("sim_date_idx", 0)
-            _bt_cutoff     = _bt_dates_done[_bt_idx - 1] if _bt_idx > 0 and _bt_dates_done else None
-            render_market_data(db, bt_prices_df=_bt_prices, bt_cutoff_date=_bt_cutoff)
+            # Only show dates the user has actually stepped through
+            _completed     = _bt_dates_done[:_bt_idx]
+            _bt_cutoff     = _completed[-1] if _completed else None
+            # Pre-filter price data to completed dates only
+            _bt_prices_view = (
+                _bt_prices[_bt_prices.index.isin(_completed)]
+                if _completed else _bt_prices.iloc[:0]
+            )
+            render_market_data(db, bt_prices_df=_bt_prices_view, bt_cutoff_date=_bt_cutoff)
         else:
             render_market_data(db)
 
