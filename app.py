@@ -28,6 +28,7 @@ from config import (
     LOOKBACK_DAYS,
     MAX_POSITION_PCT,
     MAX_TRADES_PER_DAY,
+    RESET_PASSWORD,
     SIMULATION_DAYS,
 )
 from database import PortfolioDatabase
@@ -2759,7 +2760,7 @@ def _confirm_reset_screen() -> None:
         c1, c2 = st.columns(2)
         with c1:
             if st.button("✅  Confirm", type="primary", use_container_width=True):
-                if pwd == config.RESET_PASSWORD:
+                if pwd == RESET_PASSWORD:
                     st.session_state["_reset_confirmed"] = True
                     st.rerun()
                 else:
