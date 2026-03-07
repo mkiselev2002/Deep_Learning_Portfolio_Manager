@@ -42,11 +42,21 @@ _HEADERS = {
 }
 
 
+# Cache constituents for 24 hours — the list barely changes and scraping
+# Wikipedia on every fetch adds 1-3 seconds of latency for nothing.
+_SP500_CACHE: dict = {}   # {"ts": timestamp, "df": DataFrame}
+
 def get_sp500_constituents() -> pd.DataFrame:
     """
     Scrapes the S&P 500 list from Wikipedia (with browser-like headers to avoid 403).
     Returns DataFrame with columns: symbol, name, sector, industry.
+    Caches the result in-process for 24 hours.
     """
+    import time as _time
+    cached = _SP500_CACHE.get("df")
+    if cached is not None and (_time.time() - _SP500_CACHE.get("ts", 0)) < 86400:
+        return cached
+
     resp = requests.get(SP500_WIKI_URL, headers=_HEADERS, timeout=15)
     resp.raise_for_status()
     tables = pd.read_html(io.StringIO(resp.text), header=0)
@@ -54,7 +64,11 @@ def get_sp500_constituents() -> pd.DataFrame:
     tbl.columns = ["symbol", "name", "sector", "industry"]
     # yfinance uses '-' instead of '.' (e.g. BRK.B → BRK-B)
     tbl["symbol"] = tbl["symbol"].str.replace(".", "-", regex=False)
-    return tbl.reset_index(drop=True)
+    result = tbl.reset_index(drop=True)
+
+    _SP500_CACHE["df"] = result
+    _SP500_CACHE["ts"] = _time.time()
+    return result
 
 
 def fetch_today_prices(tickers: list[str]) -> pd.DataFrame:
@@ -137,7 +151,7 @@ def fetch_and_store_prices(
     db,
     start: str | None = None,
     period: str = "60d",
-    batch_size: int = 50,
+    batch_size: int = 100,
 ) -> pd.DataFrame:
     """
     Fetch S&P 500 close prices from Yahoo Finance and upsert into db.prices.
@@ -163,12 +177,12 @@ def fetch_and_store_prices(
             if start is not None:
                 raw = yf.download(
                     batch, start=start, interval="1d",
-                    auto_adjust=True, progress=False, threads=False,
+                    auto_adjust=True, progress=False, threads=True,
                 )
             else:
                 raw = yf.download(
                     batch, period=period, interval="1d",
-                    auto_adjust=True, progress=False, threads=False,
+                    auto_adjust=True, progress=False, threads=True,
                 )
         except Exception as exc:
             logger.warning("fetch_and_store_prices: batch %d–%d failed (%s), skipping.",
