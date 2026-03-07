@@ -60,7 +60,11 @@ RSI_WINDOW: int = 14
 LOOKBACK_DAYS: int = 30                      # minimum history needed
 
 # ─── Paths ─────────────────────────────────────────────────────────────────
-DB_PATH          = str(_PROJECT_ROOT / "portfolio.db")
+# On Railway, DATA_DIR env var points to the persistent Volume (e.g. /data).
+# portfolio.db goes there so simulation progress survives redeploys.
+# backtest.db stays ephemeral (always reset per backtest run).
+_DATA_DIR        = Path(os.environ.get("DATA_DIR", str(_PROJECT_ROOT)))
+DB_PATH          = str(_DATA_DIR / "portfolio.db")
 BACKTEST_DB_PATH = str(_PROJECT_ROOT / "backtest.db")
 
 # ─── Security ───────────────────────────────────────────────────────────────
