@@ -47,7 +47,7 @@ MODEL = "claude-haiku-4-5-20251001"          # fast & cheap for an agentic loop
 
 # ─── Simulation parameters ─────────────────────────────────────────────────
 INITIAL_CAPITAL: float = 1_000_000.0
-SIMULATION_DAYS: int = 5                     # 1 trading week
+SIMULATION_DAYS: int = 10                    # ~14 calendar days (2 trading weeks)
 
 # ─── Risk constraints ──────────────────────────────────────────────────────
 MAX_POSITION_PCT: float = 0.40               # 40 % max single-position weight
@@ -60,5 +60,5 @@ RSI_WINDOW: int = 14
 LOOKBACK_DAYS: int = 30                      # minimum history needed
 
 # ─── Paths ─────────────────────────────────────────────────────────────────
-DB_PATH  = str(_PROJECT_ROOT / "portfolio.db")
-CSV_PATH = str(_PROJECT_ROOT / "data" / "sp500_prices.csv")
+DB_PATH          = str(_PROJECT_ROOT / "portfolio.db")
+BACKTEST_DB_PATH = str(_PROJECT_ROOT / "backtest.db")

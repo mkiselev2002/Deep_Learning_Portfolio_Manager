@@ -11,6 +11,10 @@ position_history – full lifecycle record for every position (open + closed)
 transactions     – append-only trade log (includes trade amount)
 daily_snapshots  – daily snapshot of total equity for plotting
 sp500_stocks     – S&P 500 stock cache with OHLCV + price_date / fetch_date
+agent_logs       – persistent agent pipeline event log
+prices           – long-format historical close prices (date, symbol, close)
+                   simulation DB: full history from 2019 + live updates
+                   backtest DB:   window snapshot (start-90d → end) loaded at backtest start
 """
 
 import json
@@ -107,13 +111,50 @@ class PortfolioDatabase:
                     date        TEXT    NOT NULL,
                     result_json TEXT    NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS agent_logs (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts         TEXT    NOT NULL DEFAULT '',
+                    day        INTEGER,
+                    date       TEXT,
+                    agent      TEXT    NOT NULL DEFAULT '',
+                    event      TEXT    NOT NULL DEFAULT '',
+                    message    TEXT    NOT NULL DEFAULT '',
+                    trades     TEXT,
+                    violations TEXT,
+                    reasoning  TEXT,
+                    api_failed INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS prices (
+                    date   TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    close  REAL,
+                    PRIMARY KEY (date, symbol)
+                );
+                CREATE INDEX IF NOT EXISTS idx_prices_date ON prices(date);
             """)
 
-        # ── Migrations: safely add columns that didn't exist in older DBs ─
+        # ── Migrations: safely add columns/tables that didn't exist in older DBs ─
         _migrations = [
             "ALTER TABLE simulation    ADD COLUMN last_advance_date TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE transactions  ADD COLUMN amount REAL NOT NULL DEFAULT 0",
             "ALTER TABLE sp500_stocks  ADD COLUMN price_date TEXT",
+            # agent_logs table added later — CREATE IF NOT EXISTS handles new DBs,
+            # but existing DBs that ran before this version need it created too.
+            """CREATE TABLE IF NOT EXISTS agent_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL DEFAULT '',
+                day INTEGER,
+                date TEXT,
+                agent TEXT NOT NULL DEFAULT '',
+                event TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL DEFAULT '',
+                trades TEXT,
+                violations TEXT,
+                reasoning TEXT,
+                api_failed INTEGER NOT NULL DEFAULT 0
+            )""",
         ]
         with self._conn() as c:
             for sql in _migrations:
@@ -124,7 +165,7 @@ class PortfolioDatabase:
 
     # ── Reset ────────────────────────────────────────────────────────────
     def reset(self, initial_capital: float = INITIAL_CAPITAL):
-        """Resets portfolio state only (keeps sp500_stocks cache intact)."""
+        """Resets portfolio state only (keeps sp500_stocks and prices tables intact)."""
         with self._conn() as c:
             c.execute("DELETE FROM simulation")
             c.execute("DELETE FROM positions")
@@ -132,6 +173,7 @@ class PortfolioDatabase:
             c.execute("DELETE FROM transactions")
             c.execute("DELETE FROM daily_snapshots")
             c.execute("DELETE FROM day_results")
+            c.execute("DELETE FROM agent_logs")
             c.execute(
                 "INSERT INTO simulation (id, cash_balance, total_portfolio_value, last_advance_date)"
                 " VALUES (1, ?, ?, '')",
@@ -139,7 +181,7 @@ class PortfolioDatabase:
             )
 
     def reset_all(self, initial_capital: float = INITIAL_CAPITAL):
-        """Full wipe — clears every table including sp500_stocks, then seeds simulation row."""
+        """Full wipe — clears every table including sp500_stocks and prices, then seeds simulation row."""
         with self._conn() as c:
             c.execute("DELETE FROM simulation")
             c.execute("DELETE FROM positions")
@@ -147,7 +189,9 @@ class PortfolioDatabase:
             c.execute("DELETE FROM transactions")
             c.execute("DELETE FROM daily_snapshots")
             c.execute("DELETE FROM day_results")
+            c.execute("DELETE FROM agent_logs")
             c.execute("DELETE FROM sp500_stocks")
+            c.execute("DELETE FROM prices")
             c.execute(
                 "INSERT INTO simulation (id, cash_balance, total_portfolio_value, last_advance_date)"
                 " VALUES (1, ?, ?, '')",
@@ -206,7 +250,13 @@ class PortfolioDatabase:
         """
         symbol = trade.get("ticker", trade.get("symbol", ""))
         action = trade["action"]
+        # Use int() for whole shares; guard against 0 to avoid ghost positions.
         shares = int(trade.get("quantity", trade.get("shares", 0)))
+        if shares < 1:
+            logger.warning(
+                "execute_trade: skipping %s %s — quantity rounds to 0.", action, symbol
+            )
+            return
         price  = float(trade["price"])
         amount = shares * price
         reason = str(trade.get("reasoning", trade.get("reason", "")))
@@ -457,3 +507,123 @@ class PortfolioDatabase:
                 "SELECT result_json FROM day_results ORDER BY day_num"
             ).fetchall()
         return [json.loads(r["result_json"]) for r in rows]
+
+    # ── Agent log persistence ─────────────────────────────────────────────────
+
+    def save_agent_log(self, entry: dict) -> None:
+        """Persist a single agent pipeline event to the database."""
+        trades_json     = json.dumps(entry.get("trades",     []), default=str)
+        violations_json = json.dumps(entry.get("violations", []), default=str)
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO agent_logs
+                   (ts, day, date, agent, event, message, trades, violations, reasoning, api_failed)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    entry.get("ts", ""),
+                    entry.get("day"),
+                    entry.get("date"),
+                    entry.get("agent", ""),
+                    entry.get("event", ""),
+                    entry.get("message", ""),
+                    trades_json,
+                    violations_json,
+                    entry.get("reasoning", ""),
+                    int(bool(entry.get("api_failed", False))),
+                ),
+            )
+
+    def load_agent_logs(self) -> list[dict]:
+        """Load all agent log entries ordered by insertion time."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM agent_logs ORDER BY id"
+            ).fetchall()
+        result = []
+        for r in rows:
+            entry = dict(r)
+            entry["trades"]     = json.loads(entry["trades"]     or "[]")
+            entry["violations"] = json.loads(entry["violations"] or "[]")
+            entry["api_failed"] = bool(entry["api_failed"])
+            result.append(entry)
+        return result
+
+    # ── Historical price data ─────────────────────────────────────────────────
+
+    def upsert_prices(self, df: pd.DataFrame) -> None:
+        """
+        Store a wide-format price DataFrame (date index, ticker columns) as
+        long-format rows in the prices table.  Existing rows are replaced.
+        """
+        records = []
+        for date_idx, row in df.iterrows():
+            date_str = pd.Timestamp(date_idx).strftime("%Y-%m-%d")
+            for symbol, close in row.items():
+                if pd.notna(close):
+                    records.append((date_str, str(symbol), float(close)))
+        if not records:
+            return
+        with self._conn() as c:
+            c.executemany(
+                "INSERT OR REPLACE INTO prices (date, symbol, close) VALUES (?, ?, ?)",
+                records,
+            )
+
+    def load_prices(self, cutoff_date=None) -> pd.DataFrame:
+        """
+        Load the prices table as a wide-format DataFrame (DatetimeIndex × tickers).
+        Pass cutoff_date to limit to dates <= that value (for backtest agents).
+        """
+        with self._conn() as c:
+            if cutoff_date is not None:
+                cutoff_str = pd.Timestamp(cutoff_date).strftime("%Y-%m-%d")
+                df = pd.read_sql(
+                    "SELECT date, symbol, close FROM prices WHERE date <= ? ORDER BY date",
+                    c, params=(cutoff_str,),
+                )
+            else:
+                df = pd.read_sql(
+                    "SELECT date, symbol, close FROM prices ORDER BY date", c
+                )
+        if df.empty:
+            return pd.DataFrame()
+        wide = df.pivot(index="date", columns="symbol", values="close")
+        wide.columns.name = None
+        wide.index = pd.to_datetime(wide.index)
+        wide.index.name = "Date"
+        return wide
+
+    def get_prices_date_range(self) -> tuple:
+        """Returns (min_date, max_date) as Timestamps, or (None, None) if empty."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT MIN(date) AS mn, MAX(date) AS mx FROM prices"
+            ).fetchone()
+        if row and row["mn"]:
+            return pd.Timestamp(row["mn"]), pd.Timestamp(row["mx"])
+        return None, None
+
+    def has_prices(self) -> bool:
+        """Returns True if the prices table has any rows."""
+        with self._conn() as c:
+            row = c.execute("SELECT COUNT(*) AS cnt FROM prices").fetchone()
+        return (row["cnt"] if row else 0) > 0
+
+    def get_prices_symbols(self) -> list[str]:
+        """Returns the distinct ticker symbols stored in the prices table."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT DISTINCT symbol FROM prices ORDER BY symbol"
+            ).fetchall()
+        return [r["symbol"] for r in rows]
+
+    def get_prices_dates(self) -> list:
+        """
+        Returns sorted list of distinct trading dates (as pd.Timestamps) from
+        the prices table.  Much faster than loading the full price matrix.
+        """
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT DISTINCT date FROM prices ORDER BY date"
+            ).fetchall()
+        return [pd.Timestamp(r["date"]) for r in rows]

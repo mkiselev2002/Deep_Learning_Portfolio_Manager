@@ -4,6 +4,11 @@ market_data.py
 Fetches real S&P 500 constituents from Wikipedia and stock prices
 via yfinance, then stores them in the local SQLite database.
 
+Price history (close prices) is stored in the `prices` table of
+whichever PortfolioDatabase instance is passed in:
+  • simulation DB  – full history from 2019 + incremental live updates
+  • backtest DB    – window snapshot (start-90 cal days → window end)
+
 Two date concepts are tracked for sp500_stocks rows
 ────────────────────────────────────────────────────
 • price_date  – the actual market date of the OHLCV quote returned by yfinance
@@ -22,9 +27,7 @@ from datetime import date
 logger = logging.getLogger(__name__)
 
 # yfinance logs "Failed download: ['XYZ']: TypeError(...)" at ERROR level for
-# tickers that return None internally — a known yfinance bug that is harmless
-# (those tickers end up all-NaN and get dropped by our post-processing).
-# Silence the whole yfinance logger so these don't pollute the terminal.
+# tickers that return None internally — a known yfinance bug that is harmless.
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 SP500_WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -83,12 +86,11 @@ def fetch_today_prices(tickers: list[str]) -> pd.DataFrame:
     rows = []
 
     if len(tickers) == 1:
-        # Single ticker: flat column structure (Open, High, Low, Close, Volume)
         sym = tickers[0]
         clean = raw.dropna(how="all")
         if not clean.empty:
-            r           = clean.iloc[-1]
-            price_date  = clean.index[-1].strftime("%Y-%m-%d")
+            r          = clean.iloc[-1]
+            price_date = clean.index[-1].strftime("%Y-%m-%d")
             rows.append({
                 "symbol":     sym,
                 "price_date": price_date,
@@ -99,11 +101,8 @@ def fetch_today_prices(tickers: list[str]) -> pd.DataFrame:
                 "volume":     _safe_int(r.get("Volume")),
             })
     else:
-        # Multiple tickers: MultiIndex columns (price_type, ticker)
         if not isinstance(raw.columns, pd.MultiIndex):
-            # Fallback for unexpected single-level structure
             return pd.DataFrame()
-
         try:
             close_df  = raw["Close"]
             open_df   = raw["Open"]
@@ -134,75 +133,100 @@ def fetch_today_prices(tickers: list[str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def fetch_sp500_prices_csv(csv_path: str, period: str = "60d") -> pd.DataFrame:
+def fetch_and_store_prices(
+    db,
+    start: str | None = None,
+    period: str = "60d",
+) -> pd.DataFrame:
     """
-    Fetches the current S&P 500 constituent list from Wikipedia, then downloads
-    daily adjusted close prices for every stock via yfinance.
+    Fetch S&P 500 close prices from Yahoo Finance and upsert into db.prices.
 
-    `period` is passed directly to yfinance (e.g. "60d", "3mo", "1y").
-    The strategy only needs ~22 trading days of history (momentum_20d + 2),
-    so 60 calendar days gives a comfortable buffer with a much faster download.
+    `start` (e.g. "2019-01-01") fetches full history from that date.
+    `period` (e.g. "60d") is used when no start date is given.
 
-    Tickers with more than 20 % missing rows are dropped (e.g. recent IPOs).
-    The result is written to csv_path and returned as a DataFrame.
+    Existing rows are upserted (INSERT OR REPLACE), so incremental calls
+    are safe.  Returns the wide-format close-price DataFrame.
 
-    Raises ValueError if yfinance returns no data at all.
+    Raises ValueError if yfinance returns no data.
     """
-    from pathlib import Path
-
-    # Step 1: get the current constituent list
     constituents = get_sp500_constituents()
     tickers = constituents["symbol"].tolist()
 
-    # Step 2: bulk-download historical closes
-    # Note: yfinance prints "Failed download" warnings to stdout for any tickers
-    # that return None internally (a known yfinance bug for some constituents).
-    # These are harmless — those tickers end up all-NaN and get dropped below.
-    raw = yf.download(
-        tickers,
-        period=period,
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
+    if start is not None:
+        raw = yf.download(
+            tickers, start=start, interval="1d",
+            auto_adjust=True, progress=False, threads=True,
+        )
+    else:
+        raw = yf.download(
+            tickers, period=period, interval="1d",
+            auto_adjust=True, progress=False, threads=True,
+        )
 
     if raw.empty:
         raise ValueError("yfinance returned no price data for S&P 500 tickers.")
 
-    # Extract close prices — bulk download always returns MultiIndex
-    if isinstance(raw.columns, pd.MultiIndex):
-        close_df = raw["Close"].copy()
-    else:
-        close_df = raw.copy()
+    close_df = raw["Close"].copy() if isinstance(raw.columns, pd.MultiIndex) else raw.copy()
 
-    # Drop rows that are entirely NaN, then drop tickers with >20 % missing
+    # Drop entirely-empty rows; drop tickers with >20 % missing values
     close_df = close_df.dropna(how="all")
-    min_rows  = int(len(close_df) * 0.80)
-    before    = len(close_df.columns)
-    close_df  = close_df.dropna(axis=1, thresh=min_rows)
-    close_df  = close_df.dropna(how="all")
-    dropped   = before - len(close_df.columns)
+    min_rows = int(len(close_df) * 0.80)
+    before   = len(close_df.columns)
+    close_df = close_df.dropna(axis=1, thresh=min_rows)
+    close_df = close_df.dropna(how="all")
+    dropped  = before - len(close_df.columns)
     close_df.index.name = "Date"
 
     logger.info(
-        "fetch_sp500_prices_csv: %d tickers downloaded, %d dropped (insufficient data).",
+        "fetch_and_store_prices: %d tickers downloaded, %d dropped (insufficient data).",
         len(close_df.columns), dropped,
     )
 
-    Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
-    close_df.to_csv(csv_path)
-
+    db.upsert_prices(close_df)
     return close_df
+
+
+def refresh_latest_prices(db) -> pd.DataFrame:
+    """
+    Append any trading days newer than the last date already in db.prices.
+    Falls back to a full fetch from 2019 if the table is empty.
+
+    Call this before each simulation step so prices are always current.
+    Returns the full updated wide-format DataFrame.
+    """
+    _, max_dt = db.get_prices_date_range()
+
+    if max_dt is None:
+        return fetch_and_store_prices(db, start="2019-01-01")
+
+    tickers = db.get_prices_symbols()
+    if not tickers:
+        return fetch_and_store_prices(db, start="2019-01-01")
+
+    raw = yf.download(
+        tickers, period="5d", interval="1d",
+        auto_adjust=True, progress=False, threads=True,
+    )
+    if raw.empty:
+        logger.warning("refresh_latest_prices: yfinance returned no data.")
+        return db.load_prices()
+
+    close_df  = raw["Close"].copy() if isinstance(raw.columns, pd.MultiIndex) else raw.copy()
+    overlap   = [c for c in tickers if c in close_df.columns]
+    close_df  = close_df[overlap]
+    new_dates = close_df.index[close_df.index > max_dt]
+
+    if new_dates.empty:
+        return db.load_prices()
+
+    db.upsert_prices(close_df.loc[new_dates])
+    return db.load_prices()
 
 
 def fetch_and_store_sp500(db) -> pd.DataFrame:
     """
-    Main entry point: fetches S&P 500 constituents + latest prices,
-    merges them, stores in DB, and returns the merged DataFrame.
-
-    The 'price_date' column records the actual market date of the OHLCV data
-    (may differ from fetch_date on weekends / market holidays).
+    Fetches S&P 500 constituents + latest OHLCV prices, merges them,
+    stores in db.sp500_stocks, and returns the merged DataFrame.
     """
     constituents = get_sp500_constituents()
     tickers = constituents["symbol"].tolist()
@@ -220,63 +244,6 @@ def fetch_and_store_sp500(db) -> pd.DataFrame:
     merged["fetch_date"] = today
     db.upsert_sp500_stocks(merged)
     return merged
-
-
-def refresh_latest_day(csv_path: str) -> pd.DataFrame:
-    """
-    Downloads the latest available close prices for all tickers already in the
-    CSV and appends any trading days newer than the last row already present.
-
-    Call this before each simulation step so the strategy always operates on
-    the most recent market data.  Returns the (possibly updated) DataFrame.
-    """
-    from pathlib import Path
-
-    path = Path(csv_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Price CSV not found: {csv_path}")
-
-    existing = pd.read_csv(csv_path, index_col=0, parse_dates=True)
-    existing.index = pd.to_datetime(existing.index)
-    tickers = existing.columns.tolist()
-
-    if not tickers:
-        return existing
-
-    last_date = existing.index.max()
-
-    # Download the last ~5 trading days for all tickers.
-    raw = yf.download(
-        tickers,
-        period="5d",
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
-
-    if raw.empty:
-        logger.warning("refresh_latest_day: yfinance returned no data.")
-        return existing
-
-    close_df = raw["Close"].copy() if isinstance(raw.columns, pd.MultiIndex) else raw.copy()
-
-    # Keep only columns already in the CSV, filter to genuinely new dates
-    overlap   = [c for c in tickers if c in close_df.columns]
-    close_df  = close_df[overlap]
-    new_dates = close_df.index[close_df.index > last_date]
-
-    if new_dates.empty:
-        return existing  # Already up to date
-
-    new_rows = close_df.loc[new_dates]
-    updated  = pd.concat([existing, new_rows])
-    updated  = updated[~updated.index.duplicated(keep="last")]
-    updated.sort_index(inplace=True)
-    updated.index.name = "Date"
-    updated.to_csv(csv_path)
-
-    return updated
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
