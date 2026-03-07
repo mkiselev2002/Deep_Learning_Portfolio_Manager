@@ -1588,7 +1588,7 @@ _EVENT_BADGES = {
 
 
 def render_agent_logs() -> None:
-    """Render the agent pipeline log — table view + timeline view."""
+    """Render the agent pipeline log — table view."""
     logs: list[dict] = st.session_state.get("agent_logs", [])
 
     st.markdown(
@@ -1602,139 +1602,42 @@ def render_agent_logs() -> None:
         st.info("No agent events yet — deal a hand to see the pipeline in action.", icon="🤖")
         return
 
-    tab_table, tab_timeline = st.tabs(["📋  Table", "🕐  Timeline"])
+    rows = []
+    for e in logs:
+        rows.append({
+            "Day":        e.get("day", ""),
+            "Date":       e.get("date", ""),
+            "Time":       e.get("ts", ""),
+            "Agent":      e.get("agent", ""),
+            "Event":      e.get("event", ""),
+            "Message":    e.get("message", ""),
+            "Trades":     len(e.get("trades", [])),
+            "Violations": len(e.get("violations", [])),
+        })
+    df_logs = pd.DataFrame(rows)
 
-    # ── TABLE VIEW ────────────────────────────────────────────────────────────
-    with tab_table:
-        rows = []
-        for e in logs:
-            rows.append({
-                "Day":     e.get("day", ""),
-                "Date":    e.get("date", ""),
-                "Time":    e.get("ts", ""),
-                "Agent":   e.get("agent", ""),
-                "Event":   e.get("event", ""),
-                "Message": e.get("message", ""),
-                "Trades":  len(e.get("trades", [])),
-                "Violations": len(e.get("violations", [])),
-            })
-        df_logs = pd.DataFrame(rows)
+    def _style_agent(val):
+        color = _AGENT_COLORS.get(val, ("#9ca3af", "#1f2937"))[0]
+        return f"color:{color}; font-weight:700"
 
-        def _style_agent(val):
-            color = _AGENT_COLORS.get(val, ("#9ca3af", "#1f2937"))[0]
-            return f"color:{color}; font-weight:700"
+    def _style_event(val):
+        color = _EVENT_BADGES.get(val, ("#9ca3af", val))[0]
+        return f"color:{color}; font-weight:800"
 
-        def _style_event(val):
-            color = _EVENT_BADGES.get(val, ("#9ca3af", val))[0]
-            return f"color:{color}; font-weight:800"
+    def _style_violations(val):
+        if isinstance(val, int) and val > 0:
+            return "color:#ef4444; font-weight:700"
+        return "color:#6b7280"
 
-        def _style_violations(val):
-            if isinstance(val, int) and val > 0:
-                return "color:#ef4444; font-weight:700"
-            return "color:#6b7280"
-
-        st.dataframe(
-            df_logs.style
-            .map(_style_agent, subset=["Agent"])
-            .map(_style_event, subset=["Event"])
-            .map(_style_violations, subset=["Violations"]),
-            hide_index=True,
-            use_container_width=True,
-            height=min(400, 40 + len(rows) * 36),
-        )
-
-        st.divider()
-        if st.button("🗑️  Clear Log", key="clear_log_table"):
-            try:
-                PortfolioDatabase().reset.__func__  # just check db is accessible
-            except Exception:
-                pass
-            # Clear from DB by running a raw delete
-            try:
-                db_instance = PortfolioDatabase()
-                with db_instance._conn() as c:
-                    c.execute("DELETE FROM agent_logs")
-            except Exception:
-                pass
-            st.session_state["agent_logs"] = []
-            st.rerun()
-
-    # ── TIMELINE VIEW ─────────────────────────────────────────────────────────
-    with tab_timeline:
-        from itertools import groupby
-        days = []
-        for day_key, group in groupby(logs, key=lambda e: (e.get("day", "?"), e.get("date", ""))):
-            days.append((day_key, list(group)))
-
-        for (day_num, date_str), events in reversed(days):
-            latest_day = days[-1][0][0]
-            with st.expander(
-                f"Day {day_num}  ·  {date_str}  ·  {len(events)} event(s)",
-                expanded=(day_num == latest_day),
-            ):
-                for entry in events:
-                    agent  = entry.get("agent", "Unknown")
-                    event  = entry.get("event", "")
-                    msg    = entry.get("message", "")
-                    ts     = entry.get("ts", "")
-
-                    ac, abg = _AGENT_COLORS.get(agent, ("#9ca3af", "#1f2937"))
-                    ec, elabel = _EVENT_BADGES.get(event, ("#9ca3af", event))
-
-                    st.markdown(
-                        f"<div style='display:flex; gap:0.75rem; align-items:flex-start; "
-                        f"padding:0.65rem 0; border-bottom:1px solid rgba(255,255,255,0.05);'>"
-                        f"<div style='min-width:110px; text-align:right;'>"
-                        f"<div style='font-size:0.6rem; color:#6b7280; font-family:monospace;'>{ts}</div>"
-                        f"<div style='display:inline-block; margin-top:3px; padding:2px 7px; "
-                        f"background:{abg}; border:1px solid {ac}44; border-radius:4px; "
-                        f"font-size:0.6rem; font-weight:700; color:{ac}; text-transform:uppercase; "
-                        f"letter-spacing:0.08em; white-space:nowrap;'>{agent}</div>"
-                        f"</div>"
-                        f"<div style='flex:1;'>"
-                        f"<span style='display:inline-block; padding:2px 8px; background:{ec}22; "
-                        f"border:1px solid {ec}55; border-radius:4px; font-size:0.6rem; "
-                        f"font-weight:800; color:{ec}; text-transform:uppercase; "
-                        f"letter-spacing:0.1em; margin-right:8px;'>{elabel}</span>"
-                        f"<span style='font-size:0.82rem; color:#d1d5db;'>{msg}</span>"
-                        f"</div>"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
-
-                    trades = entry.get("trades", [])
-                    if trades:
-                        with st.expander(f"  ↳ {len(trades)} trade(s)", expanded=False):
-                            st.dataframe(
-                                [{"Action": t.get("action",""), "Ticker": t.get("ticker",""),
-                                  "Alloc %": f"{t.get('pct',0):.1f}%",
-                                  "Reasoning": t.get("reasoning","")} for t in trades],
-                                hide_index=True, use_container_width=True,
-                            )
-
-                    violations = entry.get("violations", [])
-                    if violations:
-                        v_html = "".join(
-                            f"<div style='font-size:0.72rem;color:#fca5a5;padding:2px 0;'>⚠️ {v}</div>"
-                            for v in violations
-                        )
-                        st.markdown(
-                            f"<div style='margin:4px 0 4px 120px;background:rgba(239,68,68,0.07);"
-                            f"border-left:2px solid #ef4444;border-radius:0 4px 4px 0;"
-                            f"padding:6px 10px;'>{v_html}</div>",
-                            unsafe_allow_html=True,
-                        )
-
-        st.divider()
-        if st.button("🗑️  Clear Log", key="clear_log_timeline"):
-            try:
-                db_instance = PortfolioDatabase()
-                with db_instance._conn() as c:
-                    c.execute("DELETE FROM agent_logs")
-            except Exception:
-                pass
-            st.session_state["agent_logs"] = []
-            st.rerun()
+    st.dataframe(
+        df_logs.style
+        .map(_style_agent, subset=["Agent"])
+        .map(_style_event, subset=["Event"])
+        .map(_style_violations, subset=["Violations"]),
+        hide_index=True,
+        use_container_width=True,
+        height=min(400, 40 + len(rows) * 36),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3018,11 +2921,10 @@ def main():
     # ─────────────────────────────────────────────────────────────────────────
     # ── Main tabs
     # ─────────────────────────────────────────────────────────────────────────
-    tab_summary, tab_portfolio, tab_market, tab_logs = st.tabs([
+    tab_summary, tab_portfolio, tab_market = st.tabs([
         "🗓️  Daily Summary",
         "📊  Portfolio",
         "🌐  Market Data",
-        "🤖  Agent Logs",
     ])
 
     daily_results    = st.session_state["daily_results"]
@@ -3046,9 +2948,6 @@ def main():
             render_market_data(db, bt_prices_df=_bt_prices, bt_cutoff_date=_bt_cutoff)
         else:
             render_market_data(db)
-
-    with tab_logs:
-        render_agent_logs()
 
     # ─────────────────────────────────────────────────────────────────────────
     # ── Footer (always at the very bottom of the page)
