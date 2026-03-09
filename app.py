@@ -3019,10 +3019,17 @@ def main():
                 logger.warning("Portfolio report failed: %s", exc)
 
     # ── Compute advance flags (needed for control strip + auto-deal) ─────────
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    from datetime import time as _time
+
     if app_mode == "backtest":
         # No time gates in backtest — advance freely through historical dates
         already_ran_today = False
         _is_weekend       = False
+        _before_market    = False
+        _after_market     = False
+        _market_is_open   = True
+        _et_now           = None
         dates_remaining   = (
             st.session_state["sim_started"]
             and st.session_state["sim_date_idx"] < len(st.session_state.get("sim_dates", []))
@@ -3030,19 +3037,25 @@ def main():
     else:
         already_ran_today = db.get_last_advance_date() == today_str
         _is_weekend       = date.today().weekday() >= 5   # 5=Sat, 6=Sun
+        # Market hours gate: NYSE/NASDAQ open 9:30 AM – 4:00 PM US Eastern Time
+        _et_now        = datetime.now(_ZoneInfo("America/New_York"))
+        _before_market = _et_now.time() < _time(9, 30)
+        _after_market  = _et_now.time() >= _time(16, 0)
+        _market_is_open = not _is_weekend and not _before_market and not _after_market
         dates_remaining   = (
             st.session_state["sim_started"]
             and st.session_state["sim_date_idx"] < SIMULATION_DAYS
         )
 
     pending_confirm = st.session_state.get("pending_day_data") is not None
-    # Day-advancement gate: weekends block advancing to the next trading day,
-    # but the initial auto-deal on simulation start is allowed any day.
+    # Day-advancement gate: must be a weekday during market hours (9:30–16:00 ET).
+    # The initial auto-deal bypasses the market-hours check so a new game can
+    # be set up at any time.
     can_advance = (
         dates_remaining
         and not already_ran_today
         and not pending_confirm
-        and not _is_weekend
+        and _market_is_open
         and prices_df is not None
     )
     # Auto-deal gate: same as can_advance but without the weekend restriction
@@ -3175,6 +3188,23 @@ def main():
                     st.markdown(
                         "<div style='font-size:0.65rem; color:#f59e0b; font-weight:700; "
                         "text-align:center; padding-bottom:0.2rem;'>🗓️ Markets closed — try Monday</div>",
+                        unsafe_allow_html=True,
+                    )
+                elif app_mode != "backtest" and _before_market and dates_remaining:
+                    _mins_to_open = max(0, int(
+                        (_et_now.replace(hour=9, minute=30, second=0, microsecond=0)
+                         - _et_now).total_seconds() / 60
+                    ))
+                    _open_msg = f"opens in {_mins_to_open} min" if _mins_to_open > 0 else "opens shortly"
+                    st.markdown(
+                        f"<div style='font-size:0.65rem; color:#f59e0b; font-weight:700; "
+                        f"text-align:center; padding-bottom:0.2rem;'>🕐 Market opens 9:30 AM ET ({_open_msg})</div>",
+                        unsafe_allow_html=True,
+                    )
+                elif app_mode != "backtest" and _after_market and not already_ran_today and dates_remaining:
+                    st.markdown(
+                        "<div style='font-size:0.65rem; color:#f59e0b; font-weight:700; "
+                        "text-align:center; padding-bottom:0.2rem;'>🔔 Market closed — opens tomorrow 9:30 AM ET</div>",
                         unsafe_allow_html=True,
                     )
                 elif app_mode != "backtest" and already_ran_today and dates_remaining:
