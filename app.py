@@ -1148,37 +1148,31 @@ def render_portfolio(
     # ── Holdings ─────────────────────────────────────────────────────────────
     st.markdown("**Holdings**")
     if snap["positions"]:
+        # Build ticker → (name, sector) lookup from sp500_stocks
+        try:
+            _stocks_meta = db.get_sp500_stocks()
+            _meta_map = (
+                _stocks_meta.set_index("symbol")[["name", "sector"]].to_dict("index")
+                if not _stocks_meta.empty else {}
+            )
+        except Exception:
+            _meta_map = {}
+
         rows = []
         for t, p in snap["positions"].items():
-            # Use prices rounded to 2 dp so P/L is consistent with what is displayed
-            avg_r = round(p["average_cost"],  2)
-            cur_r = round(p["current_price"], 2)
-            pnl_val = round(p["shares"] * (cur_r - avg_r), 2)
-            pnl_pct = round((cur_r / avg_r - 1.0) * 100.0, 2) if avg_r > 0 else 0.0
+            _meta  = _meta_map.get(t, {})
+            _name  = _meta.get("name") or t
+            _sector = _meta.get("sector") or "—"
             rows.append({
                 "Ticker":    t,
+                "Company":   _name,
+                "Sector":    _sector,
                 "Qty":       round(p["shares"], 4),
-                "Avg Cost":  f"${avg_r:,.2f}",
-                "Last Px":   f"${cur_r:,.2f}",
+                "Avg Cost":  f"${round(p['average_cost'], 2):,.2f}",
                 "Mkt Value": f"${p['value']:,.2f}",
-                "P/L $":     f"${pnl_val:+,.2f}",
-                "P/L %":     f"{pnl_pct:+.2f}%",
             })
         df_pos = pd.DataFrame(rows)
-
-        def _color_pnl(val):
-            if not isinstance(val, str):
-                return ""
-            if val.startswith("+"):
-                return "color:#10b981; font-weight:700"
-            if val.startswith("-"):
-                return "color:#ef4444; font-weight:700"
-            return ""
-
-        st.dataframe(
-            df_pos.style.map(_color_pnl, subset=["P/L $", "P/L %"]),
-            hide_index=True, use_container_width=True,
-        )
+        st.dataframe(df_pos, hide_index=True, use_container_width=True)
     else:
         st.info(f"No open positions.  Bankroll: ${snap['cash']:,.2f}")
 
